@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/pkg/errors"
+	"go.step.sm/crypto/mldsa"
 	"go.step.sm/crypto/sshutil"
 	"golang.org/x/crypto/ssh"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/certificates/internal/cast"
 	"github.com/smallstep/certificates/logging"
 )
 
@@ -52,6 +54,7 @@ type Authority interface {
 	Revoke(context.Context, *authority.RevokeOptions) error
 	GetEncryptedKey(kid string) (string, error)
 	GetRoots() ([]*x509.Certificate, error)
+	GetIntermediateCertificates() []*x509.Certificate
 	GetFederation() ([]*x509.Certificate, error)
 	Version() authority.Version
 	GetCertificateRevocationList() (*authority.CertificateRevocationListInfo, error)
@@ -295,6 +298,11 @@ type RootsResponse struct {
 	Certificates []Certificate `json:"crts"`
 }
 
+// IntermediatesResponse is the response object of the intermediates request.
+type IntermediatesResponse struct {
+	Certificates []Certificate `json:"crts"`
+}
+
 // FederationResponse is the response object of the federation request.
 type FederationResponse struct {
 	Certificates []Certificate `json:"crts"`
@@ -330,7 +338,10 @@ func Route(r Router) {
 	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", ProvisionerKey)
 	r.MethodFunc("GET", "/roots", Roots)
 	r.MethodFunc("GET", "/roots.pem", RootsPEM)
+	r.MethodFunc("GET", "/intermediates", Intermediates)
+	r.MethodFunc("GET", "/intermediates.pem", IntermediatesPEM)
 	r.MethodFunc("GET", "/federation", Federation)
+
 	// SSH CA
 	r.MethodFunc("POST", "/ssh/sign", SSHSign)
 	r.MethodFunc("POST", "/ssh/renew", SSHRenew)
@@ -372,7 +383,7 @@ func Root(w http.ResponseWriter, r *http.Request) {
 	// Load root certificate with the
 	cert, err := mustAuthority(r.Context()).Root(sum)
 	if err != nil {
-		render.Error(w, r, errs.Wrapf(http.StatusNotFound, err, "%s was not found", r.RequestURI))
+		render.Error(w, r, errs.NotFoundErr(err, errs.WithMessage("root certificate with fingerprint %q was not found", sum)))
 		return
 	}
 
@@ -460,6 +471,47 @@ func RootsPEM(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Intermediates returns all the intermediate certificates of the CA.
+func Intermediates(w http.ResponseWriter, r *http.Request) {
+	intermediates := mustAuthority(r.Context()).GetIntermediateCertificates()
+	if len(intermediates) == 0 {
+		render.Error(w, r, errs.NotImplemented("error getting intermediates: method not implemented"))
+		return
+	}
+
+	certs := make([]Certificate, len(intermediates))
+	for i := range intermediates {
+		certs[i] = Certificate{intermediates[i]}
+	}
+
+	render.JSONStatus(w, r, &IntermediatesResponse{
+		Certificates: certs,
+	}, http.StatusCreated)
+}
+
+// IntermediatesPEM returns all the intermediate certificates for the CA in PEM format.
+func IntermediatesPEM(w http.ResponseWriter, r *http.Request) {
+	intermediates := mustAuthority(r.Context()).GetIntermediateCertificates()
+	if len(intermediates) == 0 {
+		render.Error(w, r, errs.NotImplemented("error getting intermediates: method not implemented"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-pem-file")
+
+	for _, crt := range intermediates {
+		block := pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: crt.Raw,
+		})
+
+		if _, err := w.Write(block); err != nil {
+			log.Error(w, r, err)
+			return
+		}
+	}
+}
+
 // Federation returns all the public certificates in the federation.
 func Federation(w http.ResponseWriter, r *http.Request) {
 	federated, err := mustAuthority(r.Context()).GetFederation()
@@ -488,7 +540,7 @@ type stepProvisioner struct {
 
 func logOtt(w http.ResponseWriter, token string) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
-		rl.WithFields(map[string]interface{}{
+		rl.WithFields(map[string]any{
 			"ott": token,
 		})
 	}
@@ -497,10 +549,11 @@ func logOtt(w http.ResponseWriter, token string) {
 // LogCertificate adds certificate fields to the log message.
 func LogCertificate(w http.ResponseWriter, cert *x509.Certificate) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
-		m := map[string]interface{}{
+		m := map[string]any{
 			"serial":      cert.SerialNumber.String(),
 			"subject":     cert.Subject.CommonName,
 			"issuer":      cert.Issuer.CommonName,
+			"sans":        fmtSans(cert),
 			"valid-from":  cert.NotBefore.Format(time.RFC3339),
 			"valid-to":    cert.NotAfter.Format(time.RFC3339),
 			"public-key":  fmtPublicKey(cert),
@@ -542,11 +595,11 @@ func LogSSHCertificate(w http.ResponseWriter, cert *ssh.Certificate) {
 			userOrHost = "user"
 		}
 		certificateType := fmt.Sprintf("%s %s certificate", parts[0], userOrHost) // e.g. ecdsa-sha2-nistp256-cert-v01@openssh.com user certificate
-		m := map[string]interface{}{
+		m := map[string]any{
 			"serial":           cert.Serial,
 			"principals":       cert.ValidPrincipals,
-			"valid-from":       time.Unix(int64(cert.ValidAfter), 0).Format(time.RFC3339),
-			"valid-to":         time.Unix(int64(cert.ValidBefore), 0).Format(time.RFC3339),
+			"valid-from":       time.Unix(cast.Int64(cert.ValidAfter), 0).Format(time.RFC3339),
+			"valid-to":         time.Unix(cast.Int64(cert.ValidBefore), 0).Format(time.RFC3339),
 			"certificate":      certificate,
 			"certificate-type": certificateType,
 		}
@@ -574,6 +627,31 @@ func ParseCursor(r *http.Request) (cursor string, limit int, err error) {
 	return
 }
 
+func fmtSans(cert *x509.Certificate) map[string][]string {
+	sans := make(map[string][]string)
+	if len(cert.DNSNames) > 0 {
+		sans["dns"] = cert.DNSNames
+	}
+	if len(cert.EmailAddresses) > 0 {
+		sans["email"] = cert.EmailAddresses
+	}
+	if size := len(cert.IPAddresses); size > 0 {
+		ips := make([]string, size)
+		for i, ip := range cert.IPAddresses {
+			ips[i] = ip.String()
+		}
+		sans["ip"] = ips
+	}
+	if size := len(cert.URIs); size > 0 {
+		uris := make([]string, size)
+		for i, u := range cert.URIs {
+			uris[i] = u.String()
+		}
+		sans["uri"] = uris
+	}
+	return sans
+}
+
 func fmtPublicKey(cert *x509.Certificate) string {
 	var params string
 	switch pk := cert.PublicKey.(type) {
@@ -583,6 +661,8 @@ func fmtPublicKey(cert *x509.Certificate) string {
 		params = strconv.Itoa(pk.Size() * 8)
 	case ed25519.PublicKey:
 		return cert.PublicKeyAlgorithm.String()
+	case *mldsa.PublicKey:
+		return pk.Parameters().String()
 	case *dsa.PublicKey:
 		params = strconv.Itoa(pk.Q.BitLen() * 8)
 	default:

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"go.step.sm/crypto/fingerprint"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/minica"
@@ -79,7 +80,7 @@ func getDefaultSigner(a *Authority) crypto.Signer {
 	return a.x509CAService.(*softcas.SoftCAS).Signer
 }
 
-func generateCertificate(t *testing.T, commonName string, sans []string, opts ...interface{}) *x509.Certificate {
+func generateCertificate(t *testing.T, commonName string, sans []string, opts ...any) *x509.Certificate {
 	t.Helper()
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -186,7 +187,7 @@ func withSigner(issuer *x509.Certificate, signer crypto.Signer) signerFunc {
 	}
 }
 
-func getCSR(t *testing.T, priv interface{}, opts ...func(*x509.CertificateRequest)) *x509.CertificateRequest {
+func getCSR(t *testing.T, priv any, opts ...func(*x509.CertificateRequest)) *x509.CertificateRequest {
 	_csr := &x509.CertificateRequest{
 		Subject:  pkix.Name{CommonName: "smallstep test"},
 		DNSNames: []string{"test.smallstep.com"},
@@ -224,15 +225,6 @@ func generateSubjectKeyID(pub crypto.PublicKey) ([]byte, error) {
 	return hash[:], nil
 }
 
-func assertHasPrefix(t *testing.T, s, p string) bool {
-	if strings.HasPrefix(s, p) {
-		return true
-	}
-	t.Helper()
-	t.Errorf("%q is not a prefix of %q", p, s)
-	return false
-}
-
 type basicConstraints struct {
 	IsCA       bool `asn1:"optional"`
 	MaxPathLen int  `asn1:"optional,default:-1"`
@@ -247,6 +239,11 @@ func (e *testEnforcer) Enforce(cert *x509.Certificate) error {
 		return e.enforcer(cert)
 	}
 	return nil
+}
+
+func assertHasPrefix(t *testing.T, s, p string) bool {
+	t.Helper()
+	return assert.True(t, strings.HasPrefix(s, p), "%q is not a prefix of %q", p, s)
 }
 
 func TestAuthority_SignWithContext(t *testing.T) {
@@ -605,6 +602,43 @@ ZYtQ9Ot36qc=
 				code:     http.StatusForbidden,
 			}
 		},
+		"fail with cnf": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+
+			auth := testAuthority(t)
+			auth.config.AuthorityConfig.Template = a.config.AuthorityConfig.Template
+			auth.db = &db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equal(t, crt.Subject.CommonName, "smallstep test")
+					assert.Equal(t, crt.DNSNames, []string{"test.smallstep.com"})
+					return nil
+				},
+			}
+
+			// Create a token with cnf
+			tok, err := generateCustomToken("smallstep test", "step-cli", testAudiences.Sign[0], key, nil, map[string]any{
+				"sans": []string{"test.smallstep.com"},
+				"cnf":  map[string]any{"x5rt#S256": "bad-fingerprint"},
+			})
+			require.NoError(t, err)
+
+			opts, err := auth.Authorize(ctx, tok)
+			require.NoError(t, err)
+
+			return &signTest{
+				auth:      auth,
+				csr:       csr,
+				extraOpts: opts,
+				signOpts:  signOpts,
+				notBefore: signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:  signOpts.NotAfter.Time().Truncate(time.Second),
+				err:       errors.New(`certificate request fingerprint does not match "bad-fingerprint"`),
+				code:      http.StatusForbidden,
+			}
+		},
 		"ok": func(t *testing.T) *signTest {
 			csr := getCSR(t, priv)
 			_a := testAuthority(t)
@@ -846,6 +880,44 @@ ZYtQ9Ot36qc=
 				extraOpts: append(extraOpts, provisioner.AttestationData{
 					PermanentIdentifier: "1234567890",
 				}),
+				signOpts:        signOpts,
+				notBefore:       signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:        signOpts.NotAfter.Time().Truncate(time.Second),
+				extensionsCount: 6,
+			}
+		},
+		"ok with cnf": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			fingerprint, err := fingerprint.New(csr.Raw, crypto.SHA256, fingerprint.Base64RawURLFingerprint)
+			require.NoError(t, err)
+
+			auth := testAuthority(t)
+			auth.config.AuthorityConfig.Template = a.config.AuthorityConfig.Template
+			auth.db = &db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equal(t, crt.Subject.CommonName, "smallstep test")
+					assert.Equal(t, crt.DNSNames, []string{"test.smallstep.com"})
+					return nil
+				},
+			}
+
+			// Create a token with cnf
+			tok, err := generateCustomToken("smallstep test", "step-cli", testAudiences.Sign[0], key, nil, map[string]any{
+				"sans": []string{"test.smallstep.com"},
+				"cnf":  map[string]any{"x5rt#S256": fingerprint},
+			})
+			require.NoError(t, err)
+
+			opts, err := auth.Authorize(ctx, tok)
+			require.NoError(t, err)
+
+			return &signTest{
+				auth:            auth,
+				csr:             csr,
+				extraOpts:       opts,
 				signOpts:        signOpts,
 				notBefore:       signOpts.NotBefore.Time().Truncate(time.Second),
 				notAfter:        signOpts.NotAfter.Time().Truncate(time.Second),
@@ -1580,6 +1652,42 @@ func TestAuthority_Revoke(t *testing.T) {
 				},
 			}
 		},
+		"fail/serial-number": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MGetCertificate: func(sn string) (*x509.Certificate, error) {
+					return nil, errors.New("not found")
+				},
+			}))
+
+			cl := jose.Claims{
+				Subject:   "token-sn",
+				Issuer:    validIssuer,
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+				ID:        "44",
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			require.NoError(t, err)
+			return test{
+				auth: _a,
+				ctx:  tlsRevokeCtx,
+				opts: &RevokeOptions{
+					Serial:     "request-sn",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					OTT:        raw,
+				},
+				err:  errors.New(`request serial number "request-sn" and token subject "token-sn" do not match`),
+				code: http.StatusForbidden,
+				checkErrDetails: func(err *errs.Error) {
+					assert.Equal(t, raw, err.Details["token"])
+				},
+			}
+		},
 		"ok/token": func() test {
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
 				MUseToken: func(id, tok string) (bool, error) {
@@ -1834,10 +1942,11 @@ func TestAuthority_CRL(t *testing.T) {
 	var revokedList []db.RevokedCertificateInfo
 
 	type test struct {
-		auth     *Authority
-		ctx      context.Context
-		expected []string
-		err      error
+		auth               *Authority
+		ctx                context.Context
+		expected           []string
+		expectedReasonCode *int
+		err                error
 	}
 	tests := map[string]func() test{
 		"fail/empty-crl": func() test {
@@ -1904,11 +2013,11 @@ func TestAuthority_CRL(t *testing.T) {
 
 			var ex []string
 
-			for i := 0; i < 100; i++ {
+			for i := range 100 {
 				sn := fmt.Sprintf("%v", i)
 
 				cl := jose.Claims{
-					Subject:   fmt.Sprintf("sn-%v", i),
+					Subject:   sn,
 					Issuer:    validIssuer,
 					NotBefore: jose.NewNumericDate(now),
 					Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
@@ -1930,9 +2039,72 @@ func TestAuthority_CRL(t *testing.T) {
 			}
 
 			return test{
-				auth:     a,
-				ctx:      crlCtx,
-				expected: ex,
+				auth:               a,
+				ctx:                crlCtx,
+				expected:           ex,
+				expectedReasonCode: &reasonCode,
+			}
+		},
+		"ok/crl-no-reason-code": func() test {
+			var localRevokedList []db.RevokedCertificateInfo
+			var localCRLStore db.CertificateRevocationListInfo
+			a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MGetCertificate: func(sn string) (*x509.Certificate, error) {
+					return nil, errors.New("not found")
+				},
+				MStoreCRL: func(i *db.CertificateRevocationListInfo) error {
+					localCRLStore = *i
+					return nil
+				},
+				MGetCRL: func() (*db.CertificateRevocationListInfo, error) {
+					return &localCRLStore, nil
+				},
+				MGetRevokedCertificates: func() (*[]db.RevokedCertificateInfo, error) {
+					return &localRevokedList, nil
+				},
+				MRevoke: func(rci *db.RevokedCertificateInfo) error {
+					localRevokedList = append(localRevokedList, *rci)
+					return nil
+				},
+			}))
+			a.config.CRL = &config.CRLConfig{
+				Enabled:          true,
+				GenerateOnRevoke: true,
+			}
+
+			var ex []string
+			zeroReasonCode := 0
+
+			for i := range 5 {
+				sn := fmt.Sprintf("%v", i)
+				cl := jose.Claims{
+					Subject:   sn,
+					Issuer:    validIssuer,
+					NotBefore: jose.NewNumericDate(now),
+					Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+					Audience:  validAudience,
+					ID:        sn,
+				}
+				raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+				require.NoError(t, err)
+				err = a.Revoke(crlCtx, &RevokeOptions{
+					Serial:     sn,
+					ReasonCode: zeroReasonCode,
+					Reason:     reason,
+					OTT:        raw,
+				})
+				require.NoError(t, err)
+				ex = append(ex, sn)
+			}
+
+			return test{
+				auth:               a,
+				ctx:                crlCtx,
+				expected:           ex,
+				expectedReasonCode: &zeroReasonCode,
 			}
 		},
 	}
@@ -1952,6 +2124,14 @@ func TestAuthority_CRL(t *testing.T) {
 			var cmpList []string
 			for _, c := range crl.RevokedCertificateEntries {
 				cmpList = append(cmpList, c.SerialNumber.String())
+				// ReasonCode 0 causes Go's x509 package to omit the reasonCode
+				// extension entirely. Parsing it back yields 0 as the zero value
+				// of the field, not from an explicit extension. This confirms the
+				// zero-code path produces a well-formed CRL, not that the
+				// extension round-trips.
+				if tc.expectedReasonCode != nil {
+					assert.Equal(t, *tc.expectedReasonCode, c.ReasonCode)
+				}
 			}
 
 			assert.Equal(t, tc.expected, cmpList)

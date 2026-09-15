@@ -5,7 +5,8 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"go.step.sm/cli-utils/step"
+
+	"github.com/smallstep/cli-utils/step"
 	"go.step.sm/crypto/sshutil"
 
 	"github.com/smallstep/certificates/authority/policy"
@@ -134,9 +135,9 @@ func CustomSSHTemplateOptions(o *Options, data sshutil.TemplateData, defaultTemp
 
 		// Add user provided data.
 		if len(so.TemplateData) > 0 {
-			userObject := make(map[string]interface{})
+			userObject := make(map[string]any)
 			if err := json.Unmarshal(so.TemplateData, &userObject); err != nil {
-				data.SetUserData(map[string]interface{}{})
+				data.SetUserData(map[string]any{})
 			} else {
 				data.SetUserData(userObject)
 			}

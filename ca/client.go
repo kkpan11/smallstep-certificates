@@ -22,23 +22,26 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/http2"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/smallstep/cli-utils/step"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/keyutil"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
+	"go.step.sm/crypto/x509util"
+
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca/client"
 	"github.com/smallstep/certificates/ca/identity"
 	"github.com/smallstep/certificates/errs"
-	"go.step.sm/cli-utils/step"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/keyutil"
-	"go.step.sm/crypto/pemutil"
-	"go.step.sm/crypto/randutil"
-	"go.step.sm/crypto/x509util"
-	"golang.org/x/net/http2"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 // DisableIdentity is a global variable to disable the identity.
@@ -51,10 +54,11 @@ type uaClient struct {
 	Client *http.Client
 }
 
-func newClient(transport http.RoundTripper) *uaClient {
+func newClient(transport http.RoundTripper, timeout time.Duration) *uaClient {
 	return &uaClient{
 		Client: &http.Client{
 			Transport: transport,
+			Timeout:   timeout,
 		},
 	}
 }
@@ -74,6 +78,10 @@ func (c *uaClient) GetTransport() http.RoundTripper {
 
 func (c *uaClient) SetTransport(tr http.RoundTripper) {
 	c.Client.Transport = tr
+}
+
+func (c *uaClient) CloseIdleConnections() {
+	c.Client.CloseIdleConnections()
 }
 
 func (c *uaClient) Get(u string) (*http.Response, error) {
@@ -145,8 +153,14 @@ type RetryFunc func(code int) bool
 // ClientOption is the type of options passed to the Client constructor.
 type ClientOption func(o *clientOptions) error
 
+// TransportDecorator is the type used to support customization of the HTTP
+// transport.
+type TransportDecorator func(http.RoundTripper) http.RoundTripper
+
 type clientOptions struct {
 	transport            http.RoundTripper
+	transportDecorator   TransportDecorator
+	timeout              time.Duration
 	rootSHA256           string
 	rootFilename         string
 	rootBundle           []byte
@@ -263,7 +277,8 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 		}
 	}
 
-	return tr, nil
+	// Wrap the transport using the decorator function if necessary
+	return decorateRoundTripper(tr, o.transportDecorator), nil
 }
 
 // WithTransport adds a custom transport to the Client. It will fail if a
@@ -274,6 +289,16 @@ func WithTransport(tr http.RoundTripper) ClientOption {
 			return err
 		}
 		o.transport = tr
+		return nil
+	}
+}
+
+// WithTransportDecorator allows customization of the HTTP transport used by the
+// client. The provided function receives the configured [http.RoundTripper] and
+// can wrap it with additional functionality.
+func WithTransportDecorator(fn TransportDecorator) ClientOption {
+	return func(o *clientOptions) error {
+		o.transportDecorator = fn
 		return nil
 	}
 }
@@ -341,7 +366,7 @@ func WithCertificate(cert tls.Certificate) ClientOption {
 
 // WithAdminX5C will set the given file as the X5C certificate for use
 // by the client.
-func WithAdminX5C(certs []*x509.Certificate, key interface{}, passwordFile string) ClientOption {
+func WithAdminX5C(certs []*x509.Certificate, key any, passwordFile string) ClientOption {
 	return func(o *clientOptions) error {
 		// Get private key from given key file
 		var (
@@ -386,8 +411,18 @@ func WithRetryFunc(fn RetryFunc) ClientOption {
 	}
 }
 
+// WithTimeout defines the time limit for requests made by this client. The
+// timeout includes connection time, any redirects, and reading the response
+// body.
+func WithTimeout(d time.Duration) ClientOption {
+	return func(o *clientOptions) error {
+		o.timeout = d
+		return nil
+	}
+}
+
 func getTransportFromFile(filename string) (http.RoundTripper, error) {
-	data, err := os.ReadFile(filename)
+	data, err := os.ReadFile(filename) // #nosec G703 -- filename is based on configuration; data read from file is processed with expected format
 	if err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", filename)
 	}
@@ -396,9 +431,8 @@ func getTransportFromFile(filename string) (http.RoundTripper, error) {
 		return nil, errors.Errorf("error parsing %s: no certificates found", filename)
 	}
 	return getDefaultTransport(&tls.Config{
-		MinVersion:               tls.VersionTLS12,
-		PreferServerCipherSuites: true,
-		RootCAs:                  pool,
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
 	}), nil
 }
 
@@ -415,9 +449,8 @@ func getTransportFromSHA256(endpoint, sum string) (http.RoundTripper, error) {
 	pool := x509.NewCertPool()
 	pool.AddCert(root.RootPEM.Certificate)
 	return getDefaultTransport(&tls.Config{
-		MinVersion:               tls.VersionTLS12,
-		PreferServerCipherSuites: true,
-		RootCAs:                  pool,
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
 	}), nil
 }
 
@@ -427,9 +460,8 @@ func getTransportFromCABundle(bundle []byte) (http.RoundTripper, error) {
 		return nil, errors.New("error parsing ca bundle: no certificates found")
 	}
 	return getDefaultTransport(&tls.Config{
-		MinVersion:               tls.VersionTLS12,
-		PreferServerCipherSuites: true,
-		RootCAs:                  pool,
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
 	}), nil
 }
 
@@ -543,10 +575,12 @@ func WithProvisionerName(name string) ProvisionerOption {
 
 // Client implements an HTTP client for the CA server.
 type Client struct {
-	client    *uaClient
-	endpoint  *url.URL
-	retryFunc RetryFunc
-	opts      []ClientOption
+	client             *uaClient
+	endpoint           *url.URL
+	retryFunc          RetryFunc
+	timeout            time.Duration
+	opts               []ClientOption
+	transportDecorator TransportDecorator
 }
 
 // NewClient creates a new Client with the given endpoint and options.
@@ -555,8 +589,9 @@ func NewClient(endpoint string, opts ...ClientOption) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	if err := o.apply(opts); err != nil {
 		return nil, err
 	}
@@ -566,17 +601,19 @@ func NewClient(endpoint string, opts ...ClientOption) (*Client, error) {
 	}
 
 	return &Client{
-		client:    newClient(tr),
-		endpoint:  u,
-		retryFunc: o.retryFunc,
-		opts:      opts,
+		client:             newClient(tr, o.timeout),
+		endpoint:           u,
+		retryFunc:          o.retryFunc,
+		timeout:            o.timeout,
+		opts:               opts,
+		transportDecorator: o.transportDecorator,
 	}, nil
 }
 
 func (c *Client) retryOnError(r *http.Response) bool {
 	if c.retryFunc != nil {
 		if c.retryFunc(r.StatusCode) {
-			o := new(clientOptions)
+			o := defaultClientOptions()
 			if err := o.apply(c.opts); err != nil {
 				return false
 			}
@@ -619,6 +656,13 @@ func (c *Client) GetRootCAs() *x509.CertPool {
 // SetTransport updates the transport of the internal HTTP client.
 func (c *Client) SetTransport(tr http.RoundTripper) {
 	c.client.SetTransport(tr)
+}
+
+// CloseIdleConnections closes any connections on its Transport which were
+// previously connected from previous requests but are now sitting idle in a
+// "keep-alive" state. It does not interrupt any connections currently in use.
+func (c *Client) CloseIdleConnections() {
+	c.client.CloseIdleConnections()
 }
 
 // Version performs the version request to the CA with an empty context and returns the
@@ -888,7 +932,7 @@ func (c *Client) RevokeWithContext(ctx context.Context, req *api.RevokeRequest, 
 	var uaClient *uaClient
 retry:
 	if tr != nil {
-		uaClient = newClient(tr)
+		uaClient = newClient(tr, c.timeout)
 	} else {
 		uaClient = c.client
 	}
@@ -1522,7 +1566,7 @@ func getRootCAPath() string {
 	return filepath.Join(step.Path(), "certs", "root_ca.crt")
 }
 
-func readJSON(r io.ReadCloser, v interface{}) error {
+func readJSON(r io.ReadCloser, v any) error {
 	defer r.Close()
 	return json.NewDecoder(r).Decode(v)
 }
@@ -1553,4 +1597,11 @@ func clientError(err error) error {
 			strings.ToUpper(uerr.Op), uerr.URL, uerr.Err)
 	}
 	return fmt.Errorf("client request failed: %w", err)
+}
+
+func decorateRoundTripper(tr http.RoundTripper, td TransportDecorator) http.RoundTripper {
+	if td != nil {
+		return td(tr)
+	}
+	return tr
 }

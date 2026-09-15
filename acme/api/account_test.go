@@ -25,12 +25,14 @@ import (
 )
 
 var (
-	defaultDisableRenewal   = false
-	globalProvisionerClaims = provisioner.Claims{
-		MinTLSDur:      &provisioner.Duration{Duration: 5 * time.Minute},
-		MaxTLSDur:      &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultTLSDur:  &provisioner.Duration{Duration: 24 * time.Hour},
-		DisableRenewal: &defaultDisableRenewal,
+	defaultDisableRenewal             = false
+	defaultDisableSmallstepExtensions = false
+	globalProvisionerClaims           = provisioner.Claims{
+		MinTLSDur:                  &provisioner.Duration{Duration: 5 * time.Minute},
+		MaxTLSDur:                  &provisioner.Duration{Duration: 24 * time.Hour},
+		DefaultTLSDur:              &provisioner.Duration{Duration: 24 * time.Hour},
+		DisableRenewal:             &defaultDisableRenewal,
+		DisableSmallstepExtensions: &defaultDisableSmallstepExtensions,
 	}
 )
 
@@ -118,7 +120,7 @@ func createEABJWS(jwk *jose.JSONWebKey, hmacKey []byte, keyID, u string) (*jose.
 			Key:       hmacKey,
 		},
 		&jose.SignerOptions{
-			ExtraHeaders: map[jose.HeaderKey]interface{}{
+			ExtraHeaders: map[jose.HeaderKey]any{
 				"kid": keyID,
 				"url": u,
 			},

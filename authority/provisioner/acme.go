@@ -3,20 +3,27 @@ package provisioner
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
-	"go.step.sm/linkedca"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/smallstep/linkedca"
+
+	"github.com/smallstep/certificates/acme/wire"
 )
 
 // ACMEChallenge represents the supported acme challenges.
 type ACMEChallenge string
 
-//nolint:stylecheck,revive // better names
+//nolint:staticcheck,revive // better names
 const (
 	// HTTP_01 is the http-01 ACME challenge.
 	HTTP_01 ACMEChallenge = "http-01"
@@ -26,6 +33,10 @@ const (
 	TLS_ALPN_01 ACMEChallenge = "tls-alpn-01"
 	// DEVICE_ATTEST_01 is the device-attest-01 ACME challenge.
 	DEVICE_ATTEST_01 ACMEChallenge = "device-attest-01"
+	// WIREOIDC_01 is the Wire OIDC challenge.
+	WIREOIDC_01 ACMEChallenge = "wire-oidc-01"
+	// WIREDPOP_01 is the Wire DPoP challenge.
+	WIREDPOP_01 ACMEChallenge = "wire-dpop-01"
 )
 
 // String returns a normalized version of the challenge.
@@ -36,7 +47,7 @@ func (c ACMEChallenge) String() string {
 // Validate returns an error if the acme challenge is not a valid one.
 func (c ACMEChallenge) Validate() error {
 	switch ACMEChallenge(c.String()) {
-	case HTTP_01, DNS_01, TLS_ALPN_01, DEVICE_ATTEST_01:
+	case HTTP_01, DNS_01, TLS_ALPN_01, DEVICE_ATTEST_01, WIREOIDC_01, WIREDPOP_01:
 		return nil
 	default:
 		return fmt.Errorf("acme challenge %q is not supported", c)
@@ -48,6 +59,9 @@ func (c ACMEChallenge) Validate() error {
 type ACMEAttestationFormat string
 
 const (
+	// ANDROIDKEY is the format used to enable device-attest-01 on Android devices.
+	ANDROIDKEY ACMEAttestationFormat = "android-key"
+
 	// APPLE is the format used to enable device-attest-01 on Apple devices.
 	APPLE ACMEAttestationFormat = "apple"
 
@@ -69,7 +83,7 @@ func (f ACMEAttestationFormat) String() string {
 // Validate returns an error if the attestation format is not a valid one.
 func (f ACMEAttestationFormat) Validate() error {
 	switch ACMEAttestationFormat(f.String()) {
-	case APPLE, STEP, TPM:
+	case APPLE, STEP, TPM, ANDROIDKEY:
 		return nil
 	default:
 		return fmt.Errorf("acme attestation format %q is not supported", f)
@@ -102,7 +116,8 @@ type ACME struct {
 	RequireEAB bool `json:"requireEAB,omitempty"`
 	// Challenges contains the enabled challenges for this provisioner. If this
 	// value is not set the default http-01, dns-01 and tls-alpn-01 challenges
-	// will be enabled, device-attest-01 will be disabled.
+	// will be enabled, device-attest-01, wire-oidc-01 and wire-dpop-01 will be
+	// disabled.
 	Challenges []ACMEChallenge `json:"challenges,omitempty"`
 	// AttestationFormats contains the enabled attestation formats for this
 	// provisioner. If this value is not set the default apple, step and tpm
@@ -114,8 +129,32 @@ type ACME struct {
 	AttestationRoots    []byte   `json:"attestationRoots,omitempty"`
 	Claims              *Claims  `json:"claims,omitempty"`
 	Options             *Options `json:"options,omitempty"`
+	androidCRL          *androidCRLCache
 	attestationRootPool *x509.CertPool
 	ctl                 *Controller
+}
+
+// androidCRLCache caches the Android attestation revocation list.
+type androidCRLCache struct {
+	current atomic.Pointer[androidCRL]
+	group   singleflight.Group
+}
+
+// androidCRL is an immutable snapshot of the Android attestation revocation
+// list. A new snapshot is swapped in atomically on each refresh, so readers
+// never observe a partially-updated set.
+type androidCRL struct {
+	serials   map[string]struct{} // set of revoked serial numbers
+	fetchedAt time.Time
+}
+
+// contains returns whether or not [*x509.Certificate]'s
+// serial number is in the map of revoked certificate serial
+// numbers. Google encodes these as lowercase hex.
+func (a *androidCRL) contains(cert *x509.Certificate) bool {
+	_, revoked := a.serials[cert.SerialNumber.Text(16)]
+
+	return revoked
 }
 
 // GetID returns the provisioner unique identifier.
@@ -132,9 +171,10 @@ func (p *ACME) GetIDForToken() string {
 	return "acme/" + p.Name
 }
 
-// GetTokenID returns the identifier of the token.
+// GetTokenID returns the identifier of the token. This provisioner will always
+// return [ErrTokenFlowNotSupported].
 func (p *ACME) GetTokenID(string) (string, error) {
-	return "", errors.New("acme provisioner does not implement GetTokenID")
+	return "", ErrTokenFlowNotSupported
 }
 
 // GetName returns the name of the provisioner.
@@ -206,8 +246,127 @@ func (p *ACME) Init(config Config) (err error) {
 		}
 	}
 
+	if err := p.initializeWireOptions(); err != nil {
+		return fmt.Errorf("failed initializing Wire options: %w", err)
+	}
+
+	p.androidCRL = &androidCRLCache{}
+
 	p.ctl, err = NewController(p, p.Claims, config, p.Options)
 	return
+}
+
+const (
+	androidAttestationStatusURL = "https://android.googleapis.com/attestation/status" // TODO(hs): make configurable through options?
+	androidCRLTTL               = 24 * time.Hour                                      // TODO(hs): make configurable through options and/or Cache-Control header?
+)
+
+// snapshot returns a fresh-enough snapshot of the Android revocation list,
+// fetching a new one if the cached copy is missing or older than androidCRLTTL.
+// Concurrent refreshes are coalesced into a single upstream request, so a burst
+// of validations results in at most one call to the Android status endpoint.
+func (c *androidCRLCache) snapshot(ctx context.Context, client HTTPClient) (*androidCRL, error) {
+	if crl := c.current.Load(); crl != nil && time.Since(crl.fetchedAt) < androidCRLTTL {
+		return crl, nil
+	}
+
+	// The cache is missing or stale. Coalesce concurrent refreshes so that only
+	// one upstream request is performed; all callers share its result.
+	v, err, _ := c.group.Do("android-crl", func() (any, error) {
+		// Re-check under the singleflight leader: another goroutine may have
+		// refreshed the snapshot while we were queued behind it.
+		if crl := c.current.Load(); crl != nil && time.Since(crl.fetchedAt) < androidCRLTTL {
+			return crl, nil
+		}
+
+		// load the CRL. We choose to let all followers get a context.Canceled when the
+		// leader's ctx is canceled. Clients will retry after.
+		return c.load(ctx, client)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return v.(*androidCRL), nil
+}
+
+// load fetches the CRL at https://android.googleapis.com/attestation/status,
+// builds the set of revoked serial numbers, and atomically publishes it as the
+// current snapshot.
+func (c *androidCRLCache) load(ctx context.Context, client HTTPClient) (*androidCRL, error) {
+	var crlResponse struct {
+		Entries map[string]struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"entries"`
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, androidAttestationStatusURL, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating Android CRL request: %w", err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed performing Android CRL request: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected Android CRL response %d", res.StatusCode)
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&crlResponse); err != nil {
+		return nil, fmt.Errorf("error decoding Android CRL JSON: %w", err)
+	}
+
+	// Build the set of revoked serials. Currently no distinction is being made
+	// based on the status of the certificate. The status can be "REVOKED" and
+	// "SUSPENDED"; both statuses result in a certificate being considered
+	// revoked.
+	serials := make(map[string]struct{}, len(crlResponse.Entries))
+	for k := range crlResponse.Entries {
+		serials[k] = struct{}{}
+	}
+
+	crl := &androidCRL{serials: serials, fetchedAt: time.Now()}
+	c.current.Store(crl)
+
+	return crl, nil
+}
+
+// initializeWireOptions initializes the options for the ACME Wire
+// integration. It'll return early if no Wire challenge types are
+// enabled.
+func (p *ACME) initializeWireOptions() error {
+	hasWireChallenges := false
+	for _, c := range p.Challenges {
+		if c == WIREOIDC_01 || c == WIREDPOP_01 {
+			hasWireChallenges = true
+			break
+		}
+	}
+	if !hasWireChallenges {
+		return nil
+	}
+
+	w, err := p.GetOptions().GetWireOptions()
+	if err != nil {
+		return fmt.Errorf("failed getting Wire options: %w", err)
+	}
+
+	if err := w.Validate(); err != nil {
+		return fmt.Errorf("failed validating Wire options: %w", err)
+	}
+
+	// at this point the Wire options have been validated, and (mostly)
+	// initialized. Remote keys will be loaded upon the first verification,
+	// currently.
+	// TODO(hs): can/should we "prime" the underlying remote keyset, to verify
+	// auto discovery works as expected? Because of the current way provisioners
+	// are initialized, doing that as part of the initialization isn't the best
+	// time to do it, because it could result in operations not resulting in the
+	// expected result in all cases.
+
+	return nil
 }
 
 // ACMEIdentifierType encodes ACME Identifier types
@@ -218,6 +377,10 @@ const (
 	IP ACMEIdentifierType = "ip"
 	// DNS is the ACME dns identifier type
 	DNS ACMEIdentifierType = "dns"
+	// WireUser is the Wire user identifier type
+	WireUser ACMEIdentifierType = "wireapp-user"
+	// WireDevice is the Wire device identifier type
+	WireDevice ACMEIdentifierType = "wireapp-device"
 )
 
 // ACMEIdentifier encodes ACME Order Identifiers
@@ -243,6 +406,18 @@ func (p *ACME) AuthorizeOrderIdentifier(_ context.Context, identifier ACMEIdenti
 		err = x509Policy.IsIPAllowed(net.ParseIP(identifier.Value))
 	case DNS:
 		err = x509Policy.IsDNSAllowed(identifier.Value)
+	case WireUser:
+		var wireID wire.UserID
+		if wireID, err = wire.ParseUserID(identifier.Value); err != nil {
+			return fmt.Errorf("failed parsing Wire SANs: %w", err)
+		}
+		err = x509Policy.AreSANsAllowed([]string{wireID.Handle})
+	case WireDevice:
+		var wireID wire.DeviceID
+		if wireID, err = wire.ParseDeviceID(identifier.Value); err != nil {
+			return fmt.Errorf("failed parsing Wire SANs: %w", err)
+		}
+		err = x509Policy.AreSANsAllowed([]string{wireID.ClientID})
 	default:
 		err = fmt.Errorf("invalid ACME identifier type '%s' provided", identifier.Type)
 	}
@@ -309,7 +484,7 @@ func (p *ACME) IsChallengeEnabled(_ context.Context, challenge ACMEChallenge) bo
 // AttestationFormat provisioner property should have at least one element.
 func (p *ACME) IsAttestationFormatEnabled(_ context.Context, format ACMEAttestationFormat) bool {
 	enabledFormats := []ACMEAttestationFormat{
-		APPLE, STEP, TPM,
+		APPLE, STEP, TPM, ANDROIDKEY,
 	}
 	if len(p.AttestationFormats) > 0 {
 		enabledFormats = p.AttestationFormats
@@ -329,4 +504,38 @@ func (p *ACME) IsAttestationFormatEnabled(_ context.Context, format ACMEAttestat
 // interface function instead to authorize?
 func (p *ACME) GetAttestationRoots() (*x509.CertPool, bool) {
 	return p.attestationRootPool, p.attestationRootPool != nil
+}
+
+// IsAndroidCertificateRevoked returns whether the serial number is
+// revoked or not.
+func (p *ACME) IsAndroidCertificateRevoked(ctx context.Context, cert *x509.Certificate) (bool, error) {
+	// the check only has to be performed when the "android-key" attestation
+	// format is enabled
+	if !p.IsAttestationFormatEnabled(ctx, ANDROIDKEY) {
+		return false, nil
+	}
+
+	if p.ctl.androidKeyCRLChecker != nil {
+		revoked, err := p.ctl.androidKeyCRLChecker.IsRevoked(ctx, cert)
+		if err != nil {
+			return true, fmt.Errorf("failed checking certificate against Android CRL: %w", err)
+		}
+
+		return revoked, nil
+	}
+
+	// No CRL check is performed using Google's CRL if custom roots
+	// are configured.
+	if p.attestationRootPool != nil {
+		return false, nil
+	}
+
+	// Fall back to the built-in CRL. A fetch error fails closed: the
+	// certificate is reported as revoked so the attestation is rejected.
+	crl, err := p.androidCRL.snapshot(ctx, p.ctl.GetHTTPClient())
+	if err != nil {
+		return true, err
+	}
+
+	return crl.contains(cert), nil
 }

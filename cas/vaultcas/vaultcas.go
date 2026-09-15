@@ -16,6 +16,7 @@ import (
 
 	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/cas/vaultcas/auth/approle"
+	"github.com/smallstep/certificates/cas/vaultcas/auth/aws"
 	"github.com/smallstep/certificates/cas/vaultcas/auth/kubernetes"
 
 	vault "github.com/hashicorp/vault/api"
@@ -84,6 +85,8 @@ func New(ctx context.Context, opts apiv1.Options) (*VaultCAS, error) {
 		method, err = kubernetes.NewKubernetesAuthMethod(vc.AuthMountPath, vc.AuthOptions)
 	case "approle":
 		method, err = approle.NewApproleAuthMethod(vc.AuthMountPath, vc.AuthOptions)
+	case "aws":
+		method, err = aws.NewAwsAuthMethod(vc.AuthMountPath, vc.AuthOptions)
 	default:
 		return nil, fmt.Errorf("unknown auth type: %s, only 'kubernetes' and 'approle' currently supported", vc.AuthType)
 	}
@@ -192,7 +195,7 @@ func (v *VaultCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv
 		sn = req.Certificate.SerialNumber
 	}
 
-	vaultReq := map[string]interface{}{
+	vaultReq := map[string]any{
 		"serial_number": formatSerialNumber(sn),
 	}
 	_, err := v.client.Logical().Write(v.config.PKIMountPath+"/revoke/", vaultReq)
@@ -209,18 +212,18 @@ func (v *VaultCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv
 func (v *VaultCAS) createCertificate(cr *x509.CertificateRequest, lifetime time.Duration) (*x509.Certificate, []*x509.Certificate, error) {
 	var vaultPKIRole string
 
-	switch {
-	case cr.PublicKeyAlgorithm == x509.RSA:
+	switch cr.PublicKeyAlgorithm {
+	case x509.RSA:
 		vaultPKIRole = v.config.PKIRoleRSA
-	case cr.PublicKeyAlgorithm == x509.ECDSA:
+	case x509.ECDSA:
 		vaultPKIRole = v.config.PKIRoleEC
-	case cr.PublicKeyAlgorithm == x509.Ed25519:
+	case x509.Ed25519:
 		vaultPKIRole = v.config.PKIRoleEd25519
 	default:
 		return nil, nil, fmt.Errorf("unsupported public key algorithm %v", cr.PublicKeyAlgorithm)
 	}
 
-	vaultReq := map[string]interface{}{
+	vaultReq := map[string]any{
 		"csr": string(pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE REQUEST",
 			Bytes: cr.Raw,

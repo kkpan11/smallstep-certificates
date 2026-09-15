@@ -21,10 +21,10 @@ type dbOrder struct {
 	Identifiers      []acme.Identifier `json:"identifiers"`
 	AuthorizationIDs []string          `json:"authorizationIDs"`
 	Status           acme.Status       `json:"status"`
-	NotBefore        time.Time         `json:"notBefore,omitempty"`
-	NotAfter         time.Time         `json:"notAfter,omitempty"`
+	NotBefore        time.Time         `json:"notBefore"`
+	NotAfter         time.Time         `json:"notAfter"`
 	CreatedAt        time.Time         `json:"createdAt"`
-	ExpiresAt        time.Time         `json:"expiresAt,omitempty"`
+	ExpiresAt        time.Time         `json:"expiresAt"`
 	CertificateID    string            `json:"certificate,omitempty"`
 	Error            *acme.Error       `json:"error,omitempty"`
 }
@@ -98,7 +98,7 @@ func (db *DB) CreateOrder(ctx context.Context, o *acme.Order) error {
 		return err
 	}
 
-	_, err = db.updateAddOrderIDs(ctx, o.AccountID, o.ID)
+	_, err = db.updateAddOrderIDs(ctx, o.AccountID, false, o.ID)
 	if err != nil {
 		return err
 	}
@@ -117,10 +117,11 @@ func (db *DB) UpdateOrder(ctx context.Context, o *acme.Order) error {
 	nu.Status = o.Status
 	nu.Error = o.Error
 	nu.CertificateID = o.CertificateID
+
 	return db.save(ctx, old.ID, nu, old, "order", orderTable)
 }
 
-func (db *DB) updateAddOrderIDs(ctx context.Context, accID string, addOids ...string) ([]string, error) {
+func (db *DB) updateAddOrderIDs(ctx context.Context, accID string, includeReadyOrders bool, addOids ...string) ([]string, error) {
 	ordersByAccountMux.Lock()
 	defer ordersByAccountMux.Unlock()
 
@@ -151,14 +152,15 @@ func (db *DB) updateAddOrderIDs(ctx context.Context, accID string, addOids ...st
 		if err = o.UpdateStatus(ctx, db); err != nil {
 			return nil, acme.WrapErrorISE(err, "error updating order %s for account %s", oid, accID)
 		}
-		if o.Status == acme.StatusPending {
+
+		if o.Status == acme.StatusPending || (o.Status == acme.StatusReady && includeReadyOrders) {
 			pendOids = append(pendOids, oid)
 		}
 	}
 	pendOids = append(pendOids, addOids...)
 	var (
-		_old interface{} = oldOids
-		_new interface{} = pendOids
+		_old any = oldOids
+		_new any = pendOids
 	)
 	switch {
 	case len(oldOids) == 0 && len(pendOids) == 0:
@@ -183,5 +185,10 @@ func (db *DB) updateAddOrderIDs(ctx context.Context, accID string, addOids ...st
 
 // GetOrdersByAccountID returns a list of order IDs owned by the account.
 func (db *DB) GetOrdersByAccountID(ctx context.Context, accID string) ([]string, error) {
-	return db.updateAddOrderIDs(ctx, accID)
+	return db.updateAddOrderIDs(ctx, accID, false)
+}
+
+// GetAllOrdersByAccountID returns a list of any order IDs owned by the account.
+func (db *DB) GetAllOrdersByAccountID(ctx context.Context, accID string) ([]string, error) {
+	return db.updateAddOrderIDs(ctx, accID, true)
 }

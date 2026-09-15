@@ -139,7 +139,7 @@ func parseCertificateRequest(t *testing.T, csrPEM string) *x509.CertificateReque
 	return csr
 }
 
-func equalJSON(t *testing.T, a, b interface{}) bool {
+func equalJSON(t *testing.T, a, b any) bool {
 	t.Helper()
 	if reflect.DeepEqual(a, b) {
 		return true
@@ -159,7 +159,7 @@ func TestClient_Version(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		expectedErr  error
@@ -201,7 +201,7 @@ func TestClient_Health(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		expectedErr  error
@@ -245,7 +245,7 @@ func TestClient_Root(t *testing.T) {
 	tests := []struct {
 		name         string
 		shasum       string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		expectedErr  error
@@ -304,7 +304,7 @@ func TestClient_Sign(t *testing.T) {
 	tests := []struct {
 		name         string
 		request      *api.SignRequest
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		expectedErr  error
@@ -367,7 +367,7 @@ func TestClient_Revoke(t *testing.T) {
 	tests := []struct {
 		name         string
 		request      *api.RevokeRequest
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		expectedErr  error
@@ -431,7 +431,7 @@ func TestClient_Renew(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -485,7 +485,7 @@ func TestClient_RenewWithToken(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -548,7 +548,7 @@ func TestClient_Rekey(t *testing.T) {
 	tests := []struct {
 		name         string
 		request      *api.RekeyRequest
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -600,7 +600,7 @@ func TestClient_Provisioners(t *testing.T) {
 		name         string
 		args         []ProvisionerOption
 		expectedURI  string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 	}{
@@ -649,7 +649,7 @@ func TestClient_ProvisionerKey(t *testing.T) {
 	tests := []struct {
 		name         string
 		kid          string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -702,7 +702,7 @@ func TestClient_Roots(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -752,7 +752,7 @@ func TestClient_Federation(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -803,7 +803,7 @@ func TestClient_SSHRoots(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -896,7 +896,7 @@ func TestClient_RootFingerprint(t *testing.T) {
 	tests := []struct {
 		name         string
 		server       *httptest.Server
-		response     interface{}
+		response     any
 		responseCode int
 		want         string
 		wantErr      bool
@@ -952,7 +952,7 @@ func TestClient_SSHBastion(t *testing.T) {
 	tests := []struct {
 		name         string
 		request      *api.SSHBastionRequest
-		response     interface{}
+		response     any
 		responseCode int
 		wantErr      bool
 		err          error
@@ -1015,6 +1015,71 @@ func TestClient_GetCaURL(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestClient_WithTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		render.JSONStatus(w, r, api.HealthResponse{Status: "ok"}, 200)
+	}))
+	defer srv.Close()
+
+	tests := []struct {
+		name      string
+		options   []ClientOption
+		assertion assert.ErrorAssertionFunc
+	}{
+		{"ok", []ClientOption{WithTransport(http.DefaultTransport)}, assert.NoError},
+		{"ok with timeout", []ClientOption{WithTransport(http.DefaultTransport), WithTimeout(5 * time.Second)}, assert.NoError},
+		{"fail with timeout", []ClientOption{WithTransport(http.DefaultTransport), WithTimeout(10 * time.Millisecond)}, assert.Error},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(srv.URL, tt.options...)
+			require.NoError(t, err)
+			assert.NotZero(t, c.timeout)
+			_, err = c.Health()
+			tt.assertion(t, err)
+		})
+	}
+}
+
+type decoratedRoundTripper func(*http.Request) (*http.Response, error)
+
+func (rt decoratedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rt(req)
+}
+
+func TestClient_WithTransportDecorator(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.RequestURI, "/root") {
+			render.JSONStatus(w, r, api.RootResponse{
+				RootPEM: api.NewCertificate(srv.Certificate()),
+			}, 200)
+			return
+		}
+
+		if s := r.Header.Get("X-Test-Header"); s != "" {
+			render.JSONStatus(w, r, api.HealthResponse{Status: s}, 200)
+		} else {
+			render.JSONStatus(w, r, api.HealthResponse{Status: "ok"}, 200)
+		}
+	}))
+	defer srv.Close()
+
+	fp := x509util.Fingerprint(srv.Certificate())
+	c, err := NewClient(srv.URL, WithRootSHA256(fp), WithTransportDecorator(func(tr http.RoundTripper) http.RoundTripper {
+		return decoratedRoundTripper(func(r *http.Request) (*http.Response, error) {
+			r.Header.Add("X-Test-Header", "some-data")
+			return tr.RoundTrip(r)
+		})
+	}))
+	require.NoError(t, err)
+	resp, err := c.Health()
+	require.NoError(t, err)
+	assert.Equal(t, "some-data", resp.Status)
 }
 
 func Test_enforceRequestID(t *testing.T) {

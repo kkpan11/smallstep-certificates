@@ -8,8 +8,8 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"fmt"
 	"log"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +17,11 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/kms"
 	kmsapi "go.step.sm/crypto/kms/apiv1"
 	"go.step.sm/crypto/kms/sshagentkms"
 	"go.step.sm/crypto/pemutil"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/authority/admin"
 	adminDBNosql "github.com/smallstep/certificates/authority/admin/db/nosql"
@@ -30,9 +30,11 @@ import (
 	"github.com/smallstep/certificates/authority/internal/constraints"
 	"github.com/smallstep/certificates/authority/policy"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/authority/provisioner/androidkey"
 	"github.com/smallstep/certificates/cas"
 	casapi "github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/internal/httptransport"
 	"github.com/smallstep/certificates/scep"
 	"github.com/smallstep/certificates/templates"
 	"github.com/smallstep/nosql"
@@ -40,15 +42,18 @@ import (
 
 // Authority implements the Certificate Authority internal interface.
 type Authority struct {
-	config        *config.Config
-	keyManager    kms.KeyManager
-	provisioners  *provisioner.Collection
-	admins        *administrator.Collection
-	db            db.AuthDB
-	adminDB       admin.DB
-	templates     *templates.Templates
-	linkedCAToken string
-	webhookClient *http.Client
+	config               *config.Config
+	keyManager           kms.KeyManager
+	provisioners         *provisioner.Collection
+	admins               *administrator.Collection
+	db                   db.AuthDB
+	adminDB              admin.DB
+	templates            *templates.Templates
+	linkedCAToken        string
+	wrapTransport        httptransport.Wrapper
+	webhookClient        provisioner.HTTPClient
+	httpClient           provisioner.HTTPClient
+	androidKeyCRLChecker androidkey.CRLChecker
 
 	// X509 CA
 	password              []byte
@@ -127,10 +132,11 @@ func New(cfg *config.Config, opts ...Option) (*Authority, error) {
 	}
 
 	var a = &Authority{
-		config:       cfg,
-		certificates: new(sync.Map),
-		validateSCEP: true,
-		meter:        noopMeter{},
+		config:        cfg,
+		certificates:  new(sync.Map),
+		validateSCEP:  true,
+		meter:         noopMeter{},
+		wrapTransport: httptransport.NoopWrapper(),
 	}
 
 	// Apply options.
@@ -141,6 +147,11 @@ func New(cfg *config.Config, opts ...Option) (*Authority, error) {
 	}
 	if a.keyManager != nil {
 		a.keyManager = newInstrumentedKeyManager(a.keyManager, a.meter)
+	}
+
+	// Initialize system cert pool
+	if err := initializeSystemCertPool(); err != nil {
+		return nil, fmt.Errorf("failed to initialize the system cert pool: %w", err)
 	}
 
 	if !a.skipInit {
@@ -157,9 +168,10 @@ func New(cfg *config.Config, opts ...Option) (*Authority, error) {
 // project without the limitations of the config.
 func NewEmbedded(opts ...Option) (*Authority, error) {
 	a := &Authority{
-		config:       &config.Config{},
-		certificates: new(sync.Map),
-		meter:        noopMeter{},
+		config:        &config.Config{},
+		certificates:  new(sync.Map),
+		meter:         noopMeter{},
+		wrapTransport: httptransport.NoopWrapper(),
 	}
 
 	// Apply options.
@@ -170,6 +182,11 @@ func NewEmbedded(opts ...Option) (*Authority, error) {
 	}
 	if a.keyManager != nil {
 		a.keyManager = newInstrumentedKeyManager(a.keyManager, a.meter)
+	}
+
+	// Initialize system cert pool
+	if err := initializeSystemCertPool(); err != nil {
+		return nil, fmt.Errorf("failed to initialize the system cert pool: %w", err)
 	}
 
 	// Validate required options
@@ -491,6 +508,15 @@ func (a *Authority) init() error {
 		a.certificates.Store(hex.EncodeToString(sum[:]), crt)
 	}
 
+	// Initialize HTTPClient with all root certs
+	clientRoots := make([]*x509.Certificate, 0, len(a.rootX509Certs)+len(a.federatedX509Certs))
+	clientRoots = append(clientRoots, a.rootX509Certs...)
+	clientRoots = append(clientRoots, a.federatedX509Certs...)
+	a.httpClient = newHTTPClient(a.wrapTransport, clientRoots...)
+	if err != nil {
+		return err
+	}
+
 	// Decrypt and load SSH keys
 	var tmplVars templates.Step
 	if a.config.SSH != nil {
@@ -508,6 +534,13 @@ func (a *Authority) init() error {
 			switch s := signer.(type) {
 			case *sshagentkms.WrappedSSHSigner:
 				a.sshCAHostCertSignKey = s.Signer
+			case *instrumentedKMSSigner:
+				switch is := s.Signer.(type) {
+				case *sshagentkms.WrappedSSHSigner:
+					a.sshCAHostCertSignKey = is.Signer
+				default:
+					a.sshCAHostCertSignKey, err = ssh.NewSignerFromSigner(s)
+				}
 			case crypto.Signer:
 				a.sshCAHostCertSignKey, err = ssh.NewSignerFromSigner(s)
 			default:
@@ -534,6 +567,13 @@ func (a *Authority) init() error {
 			switch s := signer.(type) {
 			case *sshagentkms.WrappedSSHSigner:
 				a.sshCAUserCertSignKey = s.Signer
+			case *instrumentedKMSSigner:
+				switch is := s.Signer.(type) {
+				case *sshagentkms.WrappedSSHSigner:
+					a.sshCAUserCertSignKey = is.Signer
+				default:
+					a.sshCAUserCertSignKey, err = ssh.NewSignerFromSigner(s)
+				}
 			case crypto.Signer:
 				a.sshCAUserCertSignKey, err = ssh.NewSignerFromSigner(s)
 			default:
@@ -733,7 +773,11 @@ func (a *Authority) init() error {
 						// only pass the decrypter down when it was successfully created,
 						// meaning it's an RSA key, and `CreateDecrypter` did not fail.
 						options.Decrypter = decrypter
-						options.DecrypterCert = options.Intermediates[0]
+
+						// intermediate certificates can be empty in RA mode
+						if len(options.Intermediates) > 0 {
+							options.DecrypterCert = options.Intermediates[0]
+						}
 					}
 				}
 			}
@@ -799,7 +843,7 @@ func (a *Authority) init() error {
 			a.templates = templates.DefaultTemplates()
 		}
 		if a.templates.Data == nil {
-			a.templates.Data = make(map[string]interface{})
+			a.templates.Data = make(map[string]any)
 		}
 		a.templates.Data["Step"] = tmplVars
 	}
@@ -856,6 +900,17 @@ func (a *Authority) GetAdminDatabase() admin.DB {
 // GetConfig returns the config.
 func (a *Authority) GetConfig() *config.Config {
 	return a.config
+}
+
+// GetBackdate returns the [time.Duration] representing the
+// amount of time that is to be subtracted from the current
+// time when issuing a new certificate.
+func (a *Authority) GetBackdate() *time.Duration {
+	if a.config == nil || a.config.AuthorityConfig == nil || a.config.AuthorityConfig.Backdate == nil {
+		return nil
+	}
+
+	return &a.config.AuthorityConfig.Backdate.Duration
 }
 
 // GetInfo returns information about the authority.
@@ -947,6 +1002,16 @@ func (a *Authority) getSCEPProvisionerNames() (names []string) {
 // GetSCEP returns the configured SCEP Authority
 func (a *Authority) GetSCEP() *scep.Authority {
 	return a.scepAuthority
+}
+
+// HasACMEProvisioner returns true if at least one ACME provisioner is configured.
+func (a *Authority) HasACMEProvisioner() bool {
+	for _, p := range a.config.AuthorityConfig.Provisioners {
+		if p.GetType() == provisioner.TypeACME {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Authority) startCRLGenerator() error {

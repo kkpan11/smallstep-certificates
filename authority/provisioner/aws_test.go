@@ -698,7 +698,7 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 					case *urisValidator:
 						assert.Equals(t, v.uris, nil)
 						assert.Equals(t, MethodFromContext(v.ctx), SignMethod)
-					case dnsNamesValidator:
+					case dnsNamesSubsetValidator:
 						assert.Equals(t, []string(v), []string{"ip-127-0-0-1.us-west-1.compute.internal"})
 					case *x509NamePolicyValidator:
 						assert.Equals(t, nil, v.policyEngine)
@@ -776,7 +776,7 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 	type args struct {
 		token   string
 		sshOpts SignSSHOptions
-		key     interface{}
+		key     any
 	}
 	tests := []struct {
 		name        string

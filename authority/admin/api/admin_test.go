@@ -16,7 +16,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"go.step.sm/linkedca"
+	"github.com/smallstep/linkedca"
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/admin"
@@ -26,7 +26,7 @@ import (
 type mockAdminAuthority struct {
 	MockLoadProvisionerByName func(name string) (provisioner.Interface, error)
 	MockGetProvisioners       func(nextCursor string, limit int) (provisioner.List, string, error)
-	MockRet1, MockRet2        interface{} // TODO: refactor the ret1/ret2 into those two
+	MockRet1, MockRet2        any // TODO: refactor the ret1/ret2 into those two
 	MockErr                   error
 	MockIsAdminAPIEnabled     func() bool
 	MockLoadAdminByID         func(id string) (*linkedca.Admin, bool)

@@ -92,53 +92,53 @@ func mustParseCertificateRequest(t *testing.T, pemData string) *x509.Certificate
 func testCAHelper(t *testing.T) (*url.URL, *vault.Client) {
 	t.Helper()
 
-	writeJSON := func(w http.ResponseWriter, v interface{}) {
+	writeJSON := func(w http.ResponseWriter, v any) {
 		_ = json.NewEncoder(w).Encode(v)
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.RequestURI == "/v1/auth/approle/login":
+		switch r.RequestURI {
+		case "/v1/auth/approle/login":
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, `{
 				  "auth": {
 					"client_token": "98a4c7ab-b1fe-361b-ba0b-e307aacfd587"
 				  }
 				}`)
-		case r.RequestURI == "/v1/pki/sign/ec":
+		case "/v1/pki/sign/ec":
 			w.WriteHeader(http.StatusOK)
-			cert := map[string]interface{}{"data": map[string]interface{}{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
+			cert := map[string]any{"data": map[string]any{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
 			writeJSON(w, cert)
 			return
-		case r.RequestURI == "/v1/pki/sign/rsa":
+		case "/v1/pki/sign/rsa":
 			w.WriteHeader(http.StatusOK)
-			cert := map[string]interface{}{"data": map[string]interface{}{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
+			cert := map[string]any{"data": map[string]any{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
 			writeJSON(w, cert)
 			return
-		case r.RequestURI == "/v1/pki/sign/ed25519":
+		case "/v1/pki/sign/ed25519":
 			w.WriteHeader(http.StatusOK)
-			cert := map[string]interface{}{"data": map[string]interface{}{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
+			cert := map[string]any{"data": map[string]any{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
 			writeJSON(w, cert)
 			return
-		case r.RequestURI == "/v1/pki/cert/ca_chain":
+		case "/v1/pki/cert/ca_chain":
 			w.WriteHeader(http.StatusOK)
-			cert := map[string]interface{}{"data": map[string]interface{}{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
+			cert := map[string]any{"data": map[string]any{"certificate": testCertificateSigned + "\n" + testRootCertificate}}
 			writeJSON(w, cert)
 			return
-		case r.RequestURI == "/v1/pki/revoke":
+		case "/v1/pki/revoke":
 			buf := new(bytes.Buffer)
 			buf.ReadFrom(r.Body)
 			m := make(map[string]string)
 			json.Unmarshal(buf.Bytes(), &m)
-			switch {
-			case m["serial_number"] == "1c-71-6e-18-cc-f4-70-29-5f-75-ee-64-a8-fe-69-ad":
+			switch m["serial_number"] {
+			case "1c-71-6e-18-cc-f4-70-29-5f-75-ee-64-a8-fe-69-ad":
 				w.WriteHeader(http.StatusOK)
 				return
-			case m["serial_number"] == "01-e2-40":
+			case "01-e2-40":
 				w.WriteHeader(http.StatusOK)
 				return
 			// both
-			case m["serial_number"] == "01-34-3e":
+			case "01-34-3e":
 				w.WriteHeader(http.StatusOK)
 				return
 			default:

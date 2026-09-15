@@ -11,10 +11,10 @@ import (
 
 	"github.com/pkg/errors"
 
-	"go.step.sm/cli-utils/step"
-	"go.step.sm/cli-utils/ui"
+	"github.com/smallstep/cli-utils/step"
+	"github.com/smallstep/cli-utils/ui"
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/authority/admin"
 	"github.com/smallstep/certificates/authority/config"
@@ -22,6 +22,7 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/certificates/internal/cast"
 )
 
 type raProvisioner interface {
@@ -201,7 +202,10 @@ func (a *Authority) generateProvisionerConfig(ctx context.Context) (provisioner.
 		AuthorizeRenewFunc:    a.authorizeRenewFunc,
 		AuthorizeSSHRenewFunc: a.authorizeSSHRenewFunc,
 		WebhookClient:         a.webhookClient,
+		HTTPClient:            a.httpClient,
+		WrapTransport:         a.wrapTransport,
 		SCEPKeyManager:        a.scepKeyManager,
+		AndroidKeyCRLChecker:  a.androidKeyCRLChecker,
 	}, nil
 }
 
@@ -952,8 +956,11 @@ func ProvisionerToCertificates(p *linkedca.Provisioner) (provisioner.Interface, 
 			Name:                   p.Name,
 			ServiceAccounts:        cfg.ServiceAccounts,
 			ProjectIDs:             cfg.ProjectIds,
+			OrganizationID:         cfg.OrganizationId,
 			DisableCustomSANs:      cfg.DisableCustomSans,
 			DisableTrustOnFirstUse: cfg.DisableTrustOnFirstUse,
+			DisableSSHCAUser:       cfg.DisableSshCaUser,
+			DisableSSHCAHost:       cfg.DisableSshCaHost,
 			InstanceAge:            instanceAge,
 			Claims:                 claims,
 			Options:                options,
@@ -1092,8 +1099,11 @@ func ProvisionerToLinkedca(p provisioner.Interface) (*linkedca.Provisioner, erro
 					GCP: &linkedca.GCPProvisioner{
 						ServiceAccounts:        p.ServiceAccounts,
 						ProjectIds:             p.ProjectIDs,
+						OrganizationId:         p.OrganizationID,
 						DisableCustomSans:      p.DisableCustomSANs,
 						DisableTrustOnFirstUse: p.DisableTrustOnFirstUse,
+						DisableSshCaUser:       p.DisableSSHCAUser,
+						DisableSshCaHost:       p.DisableSSHCAHost,
 						InstanceAge:            p.InstanceAge.String(),
 					},
 				},
@@ -1251,10 +1261,10 @@ func ProvisionerToLinkedca(p provisioner.Interface) (*linkedca.Provisioner, erro
 						ForceCn:                       p.ForceCN,
 						Challenge:                     p.ChallengePassword,
 						Capabilities:                  p.Capabilities,
-						MinimumPublicKeyLength:        int32(p.MinimumPublicKeyLength),
+						MinimumPublicKeyLength:        cast.Int32(p.MinimumPublicKeyLength),
 						IncludeRoot:                   p.IncludeRoot,
 						ExcludeIntermediate:           p.ExcludeIntermediate,
-						EncryptionAlgorithmIdentifier: int32(p.EncryptionAlgorithmIdentifier),
+						EncryptionAlgorithmIdentifier: cast.Int32(p.EncryptionAlgorithmIdentifier),
 						Decrypter: &linkedca.SCEPDecrypter{
 							Certificate: p.DecrypterCertificate,
 							Key:         p.DecrypterKeyPEM,
@@ -1351,6 +1361,8 @@ func attestationFormatsToCertificates(formats []linkedca.ACMEProvisioner_Attesta
 	ret := make([]provisioner.ACMEAttestationFormat, 0, len(formats))
 	for _, f := range formats {
 		switch f {
+		case linkedca.ACMEProvisioner_ANDROID_KEY:
+			ret = append(ret, provisioner.ANDROIDKEY)
 		case linkedca.ACMEProvisioner_APPLE:
 			ret = append(ret, provisioner.APPLE)
 		case linkedca.ACMEProvisioner_STEP:
@@ -1368,6 +1380,8 @@ func attestationFormatsToLinkedca(formats []provisioner.ACMEAttestationFormat) [
 	ret := make([]linkedca.ACMEProvisioner_AttestationFormatType, 0, len(formats))
 	for _, f := range formats {
 		switch provisioner.ACMEAttestationFormat(f.String()) {
+		case provisioner.ANDROIDKEY:
+			ret = append(ret, linkedca.ACMEProvisioner_ANDROID_KEY)
 		case provisioner.APPLE:
 			ret = append(ret, linkedca.ACMEProvisioner_APPLE)
 		case provisioner.STEP:

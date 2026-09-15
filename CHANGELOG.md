@@ -25,6 +25,195 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ---
 
+## [TPB] - TBD
+
+### Added
+
+- Support for ML-DSA (FIPS 204) keys, available when built with Go 1.27 or
+  newer. JOSE-based flows (JWK, JWS and JWT tokens) do not support ML-DSA yet.
+
+### Deprecated
+
+- Go 1.25 support. Go 1.26 or newer is now required.
+
+## [0.30.2] - 2026-03-22
+
+- Update golang.org/grpc to patch security advisory
+
+
+### [0.30.1] - 2026-03-18
+
+ - Fix release issue
+
+
+### [0.30.0] - 2026-03-18
+
+### Added
+
+- Warn when ACME provisioner is configured without a database (smallstep/certificates#2526)
+- Validate webhooks configured on the ca.json (smallstep/certificates#2570)
+- Add HTTP transport decorator (smallstep/certificates#2533)
+
+### Changed
+
+- Upgrade HSM-enabled Docker images from Debian Bookworm (12) to Debian Trixie
+  (13) (smallstep/certificates#2493)
+- Use JSON array format for Dockerfile's `CMD` instruction. This prevents shell
+  interpolation of environment variables like `CONFIGPATH` and `PWDPATH`,
+  ensuring consistent command execution. Commands can still be overridden via
+  Kubernetes or Docker configuration when needed (smallstep/certificates#2493)
+
+### Fixed
+
+- Fix CRL IssuingDistributionPoint marshaling to correctly unset `OnlyContainsUserCerts` and `OnlyContainsCACerts` flags (smallstep/certificates#2511)
+- Fix CRL DER download content-disposition filename extension from `.der` to `.crl` (smallstep/certificates#2537)
+- Fix SSH agent KMS when CA is configured with Prometheus instrumented signer (smallstep/certificates#2379)
+- Return helpful error message when root certificate is not found (smallstep/certificates#1893)
+- Fix missing version number when building step-ca from source archive (smallstep/certificates#2513)
+- Fix potential panic if a certificate had an empty tcg-kp-AIKCertificate extended key usage (smallstep/certificates#2569)
+- Fix CA startup when configured with SCEP and Google Cloud CAS (smallstep/certificates#2517)
+- Close idle connections on client certificate renew (smallstep/certificates#2515)
+
+
+## [0.29.0] - 2025-12-03
+
+### Added
+
+- Add support for YubiKeys 5.7.4+ (smallstep/certificates#2370)
+- Support managed device ID OID for step attestation format (smallstep/certificates#2382)
+- Add support for remote configuration of GCP Organization-Id (smallstep/certificates#2408)
+- Add additional DOCKER_STEPCA_INIT_* envs for docker/entrypoint.sh (smallstep/certificates#2461)
+- Add sd_notify support (smallstep/certificates#2463)
+
+### Changed
+
+- Use errgroup to shutdown services concurrently (smallstep/certificates#2343)
+
+### Fixed
+
+- Fix process hanging after SIGTERM (smallstep/certificates#2338)
+- Disable execute permission on a few policy/engine source files (smallstep/certificates#2435)
+- Fix backdate support for ACME provisioner (smallstep/certificates#2444)
+
+### Security
+
+- Authorization Bypass in ACME and SCEP Provisioners (smallstep/certificates#2491)
+- Improper Authorization Check for SSH Certificate Revocation (smallstep/certificates#2491)
+
+
+## [0.28.4] - 2025-07-13
+
+### Added
+
+- Add support for using key usage, extended key usage, and basic constraints
+  from certificate requests in certificate templates (smallstep/crypto#767)
+- Allow to specify audience when generating JWK provisioner tokens (smallstep/certificates#2326)
+- Add SSH certificate type to exposed metrics (smallstep/certificates#2290)
+- Enable dynamic validation of project ownership within a GCP organization
+  when using the GCP Cloud Instance Identity provisioner (smallstep/certificates#2133)
+
+### Changed
+
+- Introduce poolhttp package for improved memory performance of Authority
+  httpClients (smallstep/certificates#2325)
+
+
+## [0.28.3] - 2025-03-17
+
+- dependabot updates
+
+
+## [0.28.2] - 2025-02-20
+
+### Added
+
+- Added support for imported keys on YubiKey (smallstep/certificates#2113)
+- Enable storing ACME attestation payload (smallstep/certificates#2114)
+- Add ACME attestation format field to ACME challenge (smallstep/certificates#2124)
+
+### Changed
+
+- Added internal httptransport package to replace cloning of http.DefaultTransport (smallstep/certificates#2098, smallstep/certificates#2103, smallstep/certificates#2104)
+  - For example, replacing http.DefaultTransport clone in provisioner webhook business logic.
+
+
+## [0.28.1] - 2024-11-19
+
+### Added
+
+- Support for using template data from SCEPCHALLENGE webhooks (smallstep/certificates#2065)
+- New field to Webhook response that allows for propagation of human readable errors to the client (smallstep/certificates#2066, smallstep/certificates#2069)
+- CICD for pushing DEB and RPM packages to packages.smallstep.com on releases (smallstep/certificates#2076)
+- PKCS11 utilities in HSM container image (smallstep/certificates#2077)
+
+### Changed
+
+- Artifact names for RPM and DEB packages in conformance with standards (smallstep/certificates#2076)
+
+
+## [0.28.0] - 2024-10-29
+
+### Added
+
+- Add options to GCP IID provisioner to enable or disable signing of SSH user and host certificates (smallstep/certificates#2045)
+
+### Changed
+
+- For IID provisioners with disableCustomSANs set to true, validate that the
+  requested DNS names are a subset of the allowed DNS names (based on the IID token),
+  rather than requiring an exact match to the entire list of allowed DNS names. (smallstep/certificates#2044)
+
+
+## [0.27.5] - 2024-10-17
+
+### Added
+
+- Option to log real IP (x-forwarded-for) in logging middleware (smallstep/certificates#2002)
+
+### Fixed
+
+- Pulled in updates to smallstep/pkcs7 to fix failing Windows SCEP enrollment certificates (smallstep/certificates#1994)
+
+
+## [0.27.4] - 2024-09-13
+
+### Fixed
+
+- Release worfklow
+
+## [0.27.3] - 2024-09-13
+
+### Added
+
+- AWS auth method for Vault RA mode (smallstep/certificates#1976)
+- API endpoints for retrieving Intermediate certificates (smallstep/certificates#1962)
+- Enable use of OIDC provisioner with private identity providers and a certificate from step-ca (smallstep/certificates#1940)
+- Support for verifying `cnf` and `x5rt#S256` claim when provided in token (smallstep/certificates#1660)
+- Add Wire integration to ACME provisioner (smallstep/certificates#1666)
+
+### Changed
+
+- Clarified SSH certificate policy errors (smallstep/certificates#1951)
+
+### Fixed
+
+- Nebula ECDSA P-256 support (smallstep/certificates#1662)
+
+## [0.27.2] - 2024-07-18
+
+### Added
+
+- `--console` option to default step-ssh config (smallstep/certificates#1931)
+
+
+## [0.27.1] - 2024-07-12
+
+### Changed
+
+- Enable use of strict FQDN with a flag (smallstep/certificates#1926)
+    - This reverses a change in 0.27.0 that required the use of strict FQDNs (smallstep/certificate#1910)
+
+
 ## [0.27.0] - 2024-07-11
 
 ### Added
@@ -32,13 +221,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Support for validity windows in templates (smallstep/certificates#1903)
 - Create identity certificate with host URI when using any provisioner (smallstep/certificates#1922)
 
+### Changed
+
+- Do strict DNS lookup on ACME (smallstep/certificates#1910)
+
 ### Fixed
 
 - Handle bad attestation object in deviceAttest01 validation (smallstep/certificates#1913)
-
-### Security
-
-- Do strict DNS lookup on ACME (smallstep/certificates#1910)
 
 
 ## [0.26.2] - 2024-06-13
@@ -71,7 +260,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [0.26.0] - 2024-03-28
 
-### Added 
+### Added
 
 - [TPM KMS](https://github.com/smallstep/crypto/tree/master/kms/tpmkms) support for CA keys (smallstep/certificates#1772)
 - Propagation of HTTP request identifier using X-Request-Id header (smallstep/certificates#1743, smallstep/certificates#1542)
@@ -81,7 +270,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - AWS `ca-west-1` identity document root certificate (smallstep/certificates#1715)
 - [COSE RS1](https://www.rfc-editor.org/rfc/rfc8812.html#section-2) as a supported algorithm with ACME `device-attest-01` challenge (smallstep/certificates#1663)
 
-### Changed 
+### Changed
 
 - In an RA setup, let the CA decide the RA certificate lifetime (smallstep/certificates#1764)
 - Use Debian Bookworm in Docker containers (smallstep/certificates#1615)
@@ -131,9 +320,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Added AWS public certificates for me-central-1 and ap-southeast-3
   (smallstep/certificates#1404)
 - Added namespace field to VaultCAS JSON config (smallstep/certificates#1424)
-- Added AWS public certificates for me-central-1 and ap-southeast-3 
+- Added AWS public certificates for me-central-1 and ap-southeast-3
   (smallstep/certificates#1404)
-- Added unversioned filenames to Github release assets 
+- Added unversioned filenames to Github release assets
   (smallstep/certificates#1435)
 - Send X5C leaf certificate to webhooks (smallstep/certificates#1485)
 - Added support for disableSmallstepExtensions claim (smallstep/certificates#1484)
@@ -141,7 +330,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Added Winget release automation (smallstep/certificates#1519)
 - Added CSR to SCEPCHALLENGE webhook request body (smallstep/certificates#1523)
 - Added SCEP issuance notification webhook (smallstep/certificates#1544)
-- Added ability to disable color in the log text formatter 
+- Added ability to disable color in the log text formatter
   (smallstep/certificates(#1559)
 
 ### Changed
@@ -169,7 +358,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   (smallstep/certificates#1476, smallstep/crypto#288)
 - Fixed adding certificate templates with ASN.1 functions
   (smallstep/certificates#1500, smallstep/crypto#302)
-- Fixed a problem when the ca.json is truncated if the encoding of the 
+- Fixed a problem when the ca.json is truncated if the encoding of the
   configuration fails (e.g., new provisioner with bad template data)
   (smallstep/cli#994, smallstep/certificates#1501)
 - Fixed provisionerOptionsToLinkedCA missing template and templateData

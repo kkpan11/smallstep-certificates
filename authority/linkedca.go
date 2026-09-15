@@ -19,15 +19,16 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/tlsutil"
 	"go.step.sm/crypto/x509util"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/authority/admin"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/internal/cast"
 )
 
 const uuidPattern = "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"
@@ -336,7 +337,7 @@ func (c *linkedCaClient) Revoke(crt *x509.Certificate, rci *db.RevokedCertificat
 		Serial:         rci.Serial,
 		PemCertificate: serializeCertificate(crt),
 		Reason:         rci.Reason,
-		ReasonCode:     linkedca.RevocationReasonCode(rci.ReasonCode),
+		ReasonCode:     linkedca.RevocationReasonCode(cast.Int32(rci.ReasonCode)),
 		Passive:        true,
 	})
 
@@ -350,7 +351,7 @@ func (c *linkedCaClient) RevokeSSH(cert *ssh.Certificate, rci *db.RevokedCertifi
 		Serial:      rci.Serial,
 		Certificate: serializeSSHCertificate(cert),
 		Reason:      rci.Reason,
-		ReasonCode:  linkedca.RevocationReasonCode(rci.ReasonCode),
+		ReasonCode:  linkedca.RevocationReasonCode(cast.Int32(rci.ReasonCode)),
 		Passive:     true,
 	})
 
@@ -403,7 +404,7 @@ func createProvisionerIdentity(p provisioner.Interface) *linkedca.ProvisionerIde
 	}
 	return &linkedca.ProvisionerIdentity{
 		Id:   p.GetID(),
-		Type: linkedca.Provisioner_Type(p.GetType()),
+		Type: linkedca.Provisioner_Type(cast.Int32(int(p.GetType()))),
 		Name: p.GetName(),
 	}
 }
@@ -447,14 +448,14 @@ func serializeCertificate(crt *x509.Certificate) string {
 }
 
 func serializeCertificateChain(fullchain ...*x509.Certificate) string {
-	var chain string
+	var chain strings.Builder
 	for _, crt := range fullchain {
-		chain += string(pem.EncodeToMemory(&pem.Block{
+		chain.WriteString(string(pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
 			Bytes: crt.Raw,
-		}))
+		})))
 	}
-	return chain
+	return chain.String()
 }
 
 func serializeSSHCertificate(crt *ssh.Certificate) string {
@@ -598,7 +599,7 @@ func login(authority, token string, csr *x509.CertificateRequest, signer crypto.
 
 	// Add intermediates to the tls.Certificate
 	last := len(bundle) - 1
-	for i := 0; i < last; i++ {
+	for i := range last {
 		cert.Certificate = append(cert.Certificate, bundle[i].Raw)
 	}
 

@@ -2,15 +2,17 @@ package provisioner
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"time"
 
 	"go.step.sm/crypto/keyutil"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/smallstep/certificates/authority/policy"
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/certificates/internal/cryptoutil"
 )
 
 // DefaultCertValidity is the default validity for a certificate if none is specified.
@@ -34,7 +37,7 @@ type SignOptions struct {
 
 // SignOption is the interface used to collect all extra options used in the
 // Sign method.
-type SignOption interface{}
+type SignOption any
 
 // CertificateValidator is an interface used to validate a given X.509 certificate.
 type CertificateValidator interface {
@@ -89,17 +92,7 @@ type defaultPublicKeyValidator struct{}
 
 // Valid checks that certificate request common name matches the one configured.
 func (v defaultPublicKeyValidator) Valid(req *x509.CertificateRequest) error {
-	switch k := req.PublicKey.(type) {
-	case *rsa.PublicKey:
-		if k.Size() < keyutil.MinRSAKeyBytes {
-			return errs.Forbidden("certificate request RSA key must be at least %d bits (%d bytes)",
-				8*keyutil.MinRSAKeyBytes, keyutil.MinRSAKeyBytes)
-		}
-	case *ecdsa.PublicKey, ed25519.PublicKey:
-	default:
-		return errs.BadRequest("certificate request key of type '%T' is not supported", k)
-	}
-	return nil
+	return newPublicKeyMinimumLengthValidator(8 * keyutil.MinRSAKeyBytes).Valid(req)
 }
 
 // publicKeyMinimumLengthValidator validates the length (in bits) of the public key
@@ -119,18 +112,20 @@ func newPublicKeyMinimumLengthValidator(length int) publicKeyMinimumLengthValida
 
 // Valid checks that certificate request common name matches the one configured.
 func (v publicKeyMinimumLengthValidator) Valid(req *x509.CertificateRequest) error {
-	switch k := req.PublicKey.(type) {
-	case *rsa.PublicKey:
+	if rsaKey, ok := req.PublicKey.(*rsa.PublicKey); ok {
 		minimumLengthInBytes := v.length / 8
-		if k.Size() < minimumLengthInBytes {
+		if rsaKey.Size() < minimumLengthInBytes {
 			return errs.Forbidden("certificate request RSA key must be at least %d bits (%d bytes)",
 				v.length, minimumLengthInBytes)
 		}
-	case *ecdsa.PublicKey, ed25519.PublicKey:
-	default:
-		return errs.BadRequest("certificate request key of type '%T' is not supported", k)
+		return nil
 	}
-	return nil
+
+	if cryptoutil.IsSupportedPublicKey(req.PublicKey) {
+		return nil
+	}
+
+	return errs.BadRequest("certificate request key of type '%T' is not supported", req.PublicKey)
 }
 
 // commonNameValidator validates the common name of a certificate request.
@@ -148,7 +143,7 @@ func (v commonNameValidator) Valid(req *x509.CertificateRequest) error {
 	return nil
 }
 
-// commonNameSliceValidator validates thats the common name of a certificate
+// commonNameSliceValidator validates that the common name of a certificate
 // request is present in the slice. An empty common name is considered valid.
 type commonNameSliceValidator []string
 
@@ -156,10 +151,8 @@ func (v commonNameSliceValidator) Valid(req *x509.CertificateRequest) error {
 	if req.Subject.CommonName == "" {
 		return nil
 	}
-	for _, cn := range v {
-		if req.Subject.CommonName == cn {
-			return nil
-		}
+	if slices.Contains(v, req.Subject.CommonName) {
+		return nil
 	}
 	return errs.Forbidden("certificate request does not contain the valid common name - got %s, want %s", req.Subject.CommonName, v)
 }
@@ -183,6 +176,27 @@ func (v dnsNamesValidator) Valid(req *x509.CertificateRequest) error {
 	}
 	if !reflect.DeepEqual(want, got) {
 		return errs.Forbidden("certificate request does not contain the valid DNS names - got %v, want %v", req.DNSNames, v)
+	}
+	return nil
+}
+
+// dnsNamesSubsetValidator validates the DNS name SANs of a certificate request.
+type dnsNamesSubsetValidator []string
+
+// Valid checks that all DNS name SANs in the certificate request are present in
+// the allowed list of DNS names.
+func (v dnsNamesSubsetValidator) Valid(req *x509.CertificateRequest) error {
+	if len(req.DNSNames) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(v))
+	for _, s := range v {
+		allowed[s] = struct{}{}
+	}
+	for _, s := range req.DNSNames {
+		if _, ok := allowed[s]; !ok {
+			return errs.Forbidden("certificate request contains unauthorized DNS names - got %v, allowed %v", req.DNSNames, v)
+		}
 	}
 	return nil
 }
@@ -502,4 +516,47 @@ func (o *provisionerExtensionOption) Modify(cert *x509.Certificate, _ SignOption
 	}
 	cert.ExtraExtensions = append(cert.ExtraExtensions, ext)
 	return nil
+}
+
+// csrFingerprintValidator is a CertificateRequestValidator that checks the
+// fingerprint of the certificate request with the provided one.
+type csrFingerprintValidator string
+
+func (s csrFingerprintValidator) Valid(cr *x509.CertificateRequest) error {
+	if s != "" {
+		expected, err := base64.RawURLEncoding.DecodeString(string(s))
+		if err != nil {
+			return errs.ForbiddenErr(err, "error decoding fingerprint")
+		}
+		sum := sha256.Sum256(cr.Raw)
+		if subtle.ConstantTimeCompare(expected, sum[:]) != 1 {
+			return errs.Forbidden("certificate request fingerprint does not match %q", s)
+		}
+	}
+	return nil
+}
+
+// SignCSROption is the interface used to collect extra options in the SignCSR
+// method of the SCEP authority.
+type SignCSROption any
+
+// TemplateDataModifier is an interface that allows to modify template data.
+type TemplateDataModifier interface {
+	Modify(data x509util.TemplateData)
+}
+
+type templateDataModifier struct {
+	fn func(x509util.TemplateData)
+}
+
+func (t *templateDataModifier) Modify(data x509util.TemplateData) {
+	t.fn(data)
+}
+
+// TemplateDataModifierFunc returns a TemplateDataModifier with the given
+// function.
+func TemplateDataModifierFunc(fn func(data x509util.TemplateData)) TemplateDataModifier {
+	return &templateDataModifier{
+		fn: fn,
+	}
 }

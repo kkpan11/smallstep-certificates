@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	"go.step.sm/linkedca"
+	"github.com/smallstep/linkedca"
 )
 
 const (
@@ -123,7 +123,7 @@ type MockDB struct {
 	MockDeleteAuthorityPolicy func(ctx context.Context) error
 
 	MockError error
-	MockRet1  interface{}
+	MockRet1  any
 }
 
 // CreateProvisioner mock.

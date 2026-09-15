@@ -17,13 +17,52 @@ import (
 	"testing"
 
 	"github.com/smallstep/certificates/webhook"
+	"github.com/smallstep/linkedca"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.step.sm/crypto/kms/softkms"
 	"go.step.sm/crypto/minica"
 	"go.step.sm/crypto/pemutil"
-	"go.step.sm/linkedca"
+	"go.step.sm/crypto/x509util"
 )
+
+func generateSCEP(t *testing.T) *SCEP {
+	t.Helper()
+
+	ca, err := minica.New()
+	require.NoError(t, err)
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	cert, err := ca.Sign(&x509.Certificate{
+		Subject:   pkix.Name{CommonName: "SCEP decrypter"},
+		PublicKey: key.Public(),
+	})
+	require.NoError(t, err)
+
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: cert.Raw,
+	})
+
+	block, err := pemutil.Serialize(key, pemutil.WithPassword([]byte("password")))
+	require.NoError(t, err)
+	keyPEM := pem.EncodeToMemory(block)
+
+	p := &SCEP{
+		Type:                          "SCEP",
+		Name:                          "scep",
+		ChallengePassword:             "password123",
+		MinimumPublicKeyLength:        0,
+		DecrypterCertificate:          certPEM,
+		DecrypterKeyPEM:               keyPEM,
+		DecrypterKeyPassword:          "password",
+		EncryptionAlgorithmIdentifier: 0,
+	}
+	require.NoError(t, p.Init(Config{Claims: globalProvisionerClaims}))
+	return p
+
+}
 
 func Test_challengeValidationController_Validate(t *testing.T) {
 	dummyCSR := &x509.CertificateRequest{
@@ -37,6 +76,7 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 	}
 	type response struct {
 		Allow bool `json:"allow"`
+		Data  any  `json:"data"`
 	}
 	nokServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := &request{}
@@ -60,11 +100,22 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 		if assert.NotNil(t, req.Request) {
 			assert.Equal(t, []byte{1}, req.Request.Raw)
 		}
-		b, err := json.Marshal(response{Allow: true})
+		resp := response{Allow: true}
+		if r.Header.Get("X-Smallstep-Webhook-Id") == "webhook-id-2" {
+			resp.Data = map[string]any{
+				"ID":    "2adcbfec-5e4a-4b93-8913-640e24faf101",
+				"Email": "admin@example.com",
+			}
+		}
+		b, err := json.Marshal(resp)
 		require.NoError(t, err)
 		w.WriteHeader(200)
 		w.Write(b)
 	}))
+	t.Cleanup(func() {
+		nokServer.Close()
+		okServer.Close()
+	})
 	type fields struct {
 		client   *http.Client
 		webhooks []*Webhook
@@ -78,7 +129,7 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 		name   string
 		fields fields
 		args   args
-		server *httptest.Server
+		want   x509util.TemplateData
 		expErr error
 	}{
 		{
@@ -134,7 +185,6 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 				challenge:       "not-allowed",
 				transactionID:   "transaction-1",
 			},
-			server: nokServer,
 			expErr: errors.New("webhook server did not allow request"),
 		},
 		{
@@ -154,26 +204,58 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 				challenge:       "challenge",
 				transactionID:   "transaction-1",
 			},
-			server: okServer,
+			want: x509util.TemplateData{
+				x509util.WebhooksKey: map[string]any{
+					"webhook-name-1": nil,
+				},
+			},
+		},
+		{
+			name: "ok with data",
+			fields: fields{http.DefaultClient, []*Webhook{
+				{
+					ID:       "webhook-id-2",
+					Name:     "webhook-name-2",
+					Secret:   "MTIzNAo=",
+					Kind:     linkedca.Webhook_SCEPCHALLENGE.String(),
+					CertType: linkedca.Webhook_X509.String(),
+					URL:      okServer.URL,
+				},
+			}},
+			args: args{
+				provisionerName: "my-scep-provisioner",
+				challenge:       "challenge",
+				transactionID:   "transaction-1",
+			},
+			want: x509util.TemplateData{
+				x509util.WebhooksKey: map[string]any{
+					"webhook-name-2": map[string]any{
+						"ID":    "2adcbfec-5e4a-4b93-8913-640e24faf101",
+						"Email": "admin@example.com",
+					},
+				},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := newChallengeValidationController(tt.fields.client, tt.fields.webhooks)
-
-			if tt.server != nil {
-				defer tt.server.Close()
-			}
-
+			c := newChallengeValidationController(tt.fields.client, nil, tt.fields.webhooks)
 			ctx := context.Background()
-			err := c.Validate(ctx, dummyCSR, tt.args.provisionerName, tt.args.challenge, tt.args.transactionID)
-
+			got, err := c.Validate(ctx, dummyCSR, tt.args.provisionerName, tt.args.challenge, tt.args.transactionID)
 			if tt.expErr != nil {
 				assert.EqualError(t, err, tt.expErr.Error())
 				return
 			}
-
 			assert.NoError(t, err)
+			data := x509util.TemplateData{}
+			for _, o := range got {
+				if m, ok := o.(TemplateDataModifier); ok {
+					m.Modify(data)
+				} else {
+					t.Errorf("Validate() got = %T, want TemplateDataModifier", o)
+				}
+			}
+			assert.Equal(t, tt.want, data)
 		})
 	}
 }
@@ -197,6 +279,8 @@ func Test_selectValidationMethod(t *testing.T) {
 			Options: &Options{
 				Webhooks: []*Webhook{
 					{
+						Name: "challenge",
+						URL:  "https://scep.challenge",
 						Kind: linkedca.Webhook_SCEPCHALLENGE.String(),
 					},
 				},
@@ -213,6 +297,8 @@ func Test_selectValidationMethod(t *testing.T) {
 			Options: &Options{
 				Webhooks: []*Webhook{
 					{
+						Name: "authorizing",
+						URL:  "https://scep.authorizing",
 						Kind: linkedca.Webhook_AUTHORIZING.String(),
 					},
 				},
@@ -229,6 +315,8 @@ func Test_selectValidationMethod(t *testing.T) {
 			Options: &Options{
 				Webhooks: []*Webhook{
 					{
+						Name: "authorizing",
+						URL:  "https://scep.authorizing",
 						Kind: linkedca.Webhook_AUTHORIZING.String(),
 					},
 				},
@@ -257,8 +345,9 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 	}
 	type response struct {
 		Allow bool `json:"allow"`
+		Data  any  `json:"data"`
 	}
-	okServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	okServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := &request{}
 		err := json.NewDecoder(r.Body).Decode(req)
 		require.NoError(t, err)
@@ -268,11 +357,20 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 		if assert.NotNil(t, req.Request) {
 			assert.Equal(t, []byte{1}, req.Request.Raw)
 		}
-		b, err := json.Marshal(response{Allow: true})
+		resp := response{Allow: true}
+		if r.Header.Get("X-Smallstep-Webhook-Id") == "webhook-id-2" {
+			resp.Data = map[string]any{
+				"ID":    "2adcbfec-5e4a-4b93-8913-640e24faf101",
+				"Email": "admin@example.com",
+			}
+		}
+		b, err := json.Marshal(resp)
 		require.NoError(t, err)
 		w.WriteHeader(200)
 		w.Write(b)
 	}))
+	httpclient := okServer.Client()
+	t.Cleanup(okServer.Close)
 	type args struct {
 		challenge     string
 		transactionID string
@@ -282,6 +380,7 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 		p      *SCEP
 		server *httptest.Server
 		args   args
+		want   x509util.TemplateData
 		expErr error
 	}{
 		{"ok/webhooks", &SCEP{
@@ -299,9 +398,43 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 					},
 				},
 			},
-		}, okServer, args{"webhook-challenge", "webhook-transaction-1"},
-			nil,
-		},
+		}, okServer, args{"webhook-challenge", "webhook-transaction-1"}, x509util.TemplateData{
+			x509util.WebhooksKey: map[string]any{
+				"webhook-name-1": nil,
+			},
+		}, nil},
+		{"ok/with-data", &SCEP{
+			Name: "SCEP",
+			Type: "SCEP",
+			Options: &Options{
+				Webhooks: []*Webhook{
+					{
+						ID:       "webhook-id-1",
+						Name:     "webhook-name-1",
+						Secret:   "MTIzNAo=",
+						Kind:     linkedca.Webhook_SCEPCHALLENGE.String(),
+						CertType: linkedca.Webhook_X509.String(),
+						URL:      okServer.URL,
+					},
+					{
+						ID:       "webhook-id-2",
+						Name:     "webhook-name-2",
+						Secret:   "MTIzNAo=",
+						Kind:     linkedca.Webhook_SCEPCHALLENGE.String(),
+						CertType: linkedca.Webhook_X509.String(),
+						URL:      okServer.URL,
+					},
+				},
+			},
+		}, okServer, args{"webhook-challenge", "webhook-transaction-1"}, x509util.TemplateData{
+			x509util.WebhooksKey: map[string]any{
+				"webhook-name-1": nil,
+				"webhook-name-2": map[string]any{
+					"ID":    "2adcbfec-5e4a-4b93-8913-640e24faf101",
+					"Email": "admin@example.com",
+				},
+			},
+		}, nil},
 		{"fail/webhooks-secret-configuration", &SCEP{
 			Name: "SCEP",
 			Type: "SCEP",
@@ -317,60 +450,53 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 					},
 				},
 			},
-		}, nil, args{"webhook-challenge", "webhook-transaction-1"},
-			errors.New("failed executing webhook request: illegal base64 data at input byte 0"),
-		},
+		}, nil, args{"webhook-challenge", "webhook-transaction-1"}, nil, errors.New("failed executing webhook request: illegal base64 data at input byte 0")},
 		{"ok/static-challenge", &SCEP{
 			Name:              "SCEP",
 			Type:              "SCEP",
 			Options:           &Options{},
 			ChallengePassword: "secret-static-challenge",
-		}, nil, args{"secret-static-challenge", "static-transaction-1"},
-			nil,
-		},
+		}, nil, args{"secret-static-challenge", "static-transaction-1"}, x509util.TemplateData{}, nil},
 		{"fail/wrong-static-challenge", &SCEP{
 			Name:              "SCEP",
 			Type:              "SCEP",
 			Options:           &Options{},
 			ChallengePassword: "secret-static-challenge",
-		}, nil, args{"the-wrong-challenge-secret", "static-transaction-1"},
-			errors.New("invalid challenge password provided"),
-		},
+		}, nil, args{"the-wrong-challenge-secret", "static-transaction-1"}, nil, errors.New("invalid challenge password provided")},
 		{"ok/no-challenge", &SCEP{
 			Name:              "SCEP",
 			Type:              "SCEP",
 			Options:           &Options{},
 			ChallengePassword: "",
-		}, nil, args{"", "static-transaction-1"},
-			nil,
-		},
+		}, nil, args{"", "static-transaction-1"}, x509util.TemplateData{}, nil},
 		{"fail/no-challenge-but-provided", &SCEP{
 			Name:              "SCEP",
 			Type:              "SCEP",
 			Options:           &Options{},
 			ChallengePassword: "",
-		}, nil, args{"a-challenge-value", "static-transaction-1"},
-			errors.New("invalid challenge password provided"),
-		},
+		}, nil, args{"a-challenge-value", "static-transaction-1"}, nil, errors.New("invalid challenge password provided")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
-			if tt.server != nil {
-				defer tt.server.Close()
-			}
-
-			err := tt.p.Init(Config{Claims: globalProvisionerClaims, WebhookClient: http.DefaultClient})
+			err := tt.p.Init(Config{Claims: globalProvisionerClaims, WebhookClient: httpclient})
 			require.NoError(t, err)
 			ctx := context.Background()
 
-			err = tt.p.ValidateChallenge(ctx, dummyCSR, tt.args.challenge, tt.args.transactionID)
+			got, err := tt.p.ValidateChallenge(ctx, dummyCSR, tt.args.challenge, tt.args.transactionID)
 			if tt.expErr != nil {
 				assert.EqualError(t, err, tt.expErr.Error())
 				return
 			}
-
 			assert.NoError(t, err)
+			data := x509util.TemplateData{}
+			for _, o := range got {
+				if m, ok := o.(TemplateDataModifier); ok {
+					m.Modify(data)
+				} else {
+					t.Errorf("Validate() got = %T, want TemplateDataModifier", o)
+				}
+			}
+			assert.Equal(t, tt.want, data)
 		})
 	}
 }
@@ -640,4 +766,18 @@ func TestSCEP_Init(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSCEP_Getters(t *testing.T) {
+	p := generateSCEP(t)
+	assert.Equal(t, "scep/scep", p.GetID())
+	assert.Equal(t, "scep", p.GetName())
+	assert.Equal(t, TypeSCEP, p.GetType())
+	kid, key, ok := p.GetEncryptedKey()
+	if kid != "" || key != "" || ok == true {
+		t.Errorf("ACME.GetEncryptedKey() = (%v, %v, %v), want (%v, %v, %v)", kid, key, ok, "", "", false)
+	}
+	tokenID, err := p.GetTokenID("token")
+	assert.Empty(t, tokenID)
+	assert.Equal(t, ErrTokenFlowNotSupported, err)
 }

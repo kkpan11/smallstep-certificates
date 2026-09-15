@@ -21,6 +21,8 @@ import (
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/randutil"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/smallstep/certificates/authority/provisioner/gcp"
 )
 
 var (
@@ -84,7 +86,7 @@ O4vZCKd4vzljH6eL+OECQHHxhYoTW7lFpKGnUDG9fPZ3eYzWpgka6w1vvBk10BAu
 6fbwppM9pQ7DPMg7V6YGEjjT0gX9B9TttfHxGhvtZNQ=
 -----END RSA PRIVATE KEY-----`
 
-func must(args ...interface{}) []interface{} {
+func must(args ...any) []any {
 	if l := len(args); l > 0 && args[l-1] != nil {
 		if err, ok := args[l-1].(error); ok {
 			panic(err)
@@ -108,7 +110,7 @@ func generateJSONWebKey() (*jose.JSONWebKey, error) {
 
 func generateJSONWebKeySet(n int) (jose.JSONWebKeySet, error) {
 	var keySet jose.JSONWebKeySet
-	for i := 0; i < n; i++ {
+	for range n {
 		key, err := generateJSONWebKey()
 		if err != nil {
 			return jose.JSONWebKeySet{}, err
@@ -190,7 +192,7 @@ func generateJWK() (*JWK, error) {
 	return p, err
 }
 
-func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
+func generateK8sSA(inputPubKey any) (*K8sSA, error) {
 	fooPubB, err := os.ReadFile("./testdata/certs/foo.pub")
 	if err != nil {
 		return nil, err
@@ -208,7 +210,7 @@ func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
 		return nil, err
 	}
 
-	pubKeys := []interface{}{fooPub, barPub}
+	pubKeys := []any{fooPub, barPub}
 	if inputPubKey != nil {
 		pubKeys = append(pubKeys, inputPubKey)
 	}
@@ -363,15 +365,18 @@ func generateGCP() (*GCP, error) {
 		return nil, err
 	}
 	p := &GCP{
-		Type:            "GCP",
-		Name:            name,
-		ServiceAccounts: []string{serviceAccount},
-		Claims:          &globalProvisionerClaims,
-		config:          newGCPConfig(),
+		Type:             "GCP",
+		Name:             name,
+		ServiceAccounts:  []string{serviceAccount},
+		Claims:           &globalProvisionerClaims,
+		DisableSSHCAHost: &DefaultDisableSSHCAHost,
+		DisableSSHCAUser: &DefaultDisableSSHCAUser,
+		config:           newGCPConfig(),
 		keyStore: &keyStore{
 			keySet: jose.JSONWebKeySet{Keys: []jose.JSONWebKey{*jwk}},
 			expiry: time.Now().Add(24 * time.Hour),
 		},
+		projectValidator: &gcp.ProjectValidator{},
 	}
 	p.ctl, err = NewController(p, p.Claims, Config{
 		Audiences: testAudiences.WithFragment("gcp/" + name),
@@ -620,7 +625,7 @@ func generateAzureWithServer() (*Azure, *httptest.Server, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	writeJSON := func(w http.ResponseWriter, v interface{}) {
+	writeJSON := func(w http.ResponseWriter, v any) {
 		b, err := json.Marshal(v)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -683,14 +688,14 @@ func generateAzureWithServer() (*Azure, *httptest.Server, error) {
 
 func generateCollection(nJWK, nOIDC int) (*Collection, error) {
 	col := NewCollection(testAudiences)
-	for i := 0; i < nJWK; i++ {
+	for range nJWK {
 		p, err := generateJWK()
 		if err != nil {
 			return nil, err
 		}
 		col.Store(p)
 	}
-	for i := 0; i < nOIDC; i++ {
+	for range nOIDC {
 		p, err := generateOIDC()
 		if err != nil {
 			return nil, err
@@ -763,6 +768,37 @@ func generateToken(sub, iss, aud, email string, sans []string, iat time.Time, jw
 		SANS:  sans,
 	}
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
+}
+
+func generateCustomToken(sub, iss, aud string, jwk *jose.JSONWebKey, extraHeaders, extraClaims map[string]any) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for k, v := range extraHeaders {
+		so.WithHeader(jose.HeaderKey(k), v)
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := randutil.ASCII(64)
+	if err != nil {
+		return "", err
+	}
+	iat := time.Now()
+	claims := jose.Claims{
+		ID:        id,
+		Subject:   sub,
+		Issuer:    iss,
+		IssuedAt:  jose.NewNumericDate(iat),
+		NotBefore: jose.NewNumericDate(iat),
+		Expiry:    jose.NewNumericDate(iat.Add(5 * time.Minute)),
+		Audience:  []string{aud},
+	}
+	return jose.Signed(sig).Claims(claims).Claims(extraClaims).CompactSerialize()
 }
 
 func generateOIDCToken(sub, iss, aud, email, preferredUsername string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
@@ -1009,10 +1045,12 @@ func generateAzureToken(sub, iss, aud, tenantID, subscriptionID, resourceGroup, 
 	if err != nil {
 		return "", err
 	}
+
 	var xmsMirID string
-	if resourceType == "vm" {
+	switch resourceType {
+	case "vm":
 		xmsMirID = fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s", subscriptionID, resourceGroup, resourceName)
-	} else if resourceType == "uai" {
+	case "uai":
 		xmsMirID = fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ManagedIdentity/userAssignedIdentities/%s", subscriptionID, resourceGroup, resourceName)
 	}
 
@@ -1066,11 +1104,11 @@ func parseAWSToken(token string) (*jose.JSONWebToken, *awsPayload, error) {
 	return tok, claims, nil
 }
 
-func generateJWKServer(n int) *httptest.Server {
+func generateJWKServerHandler(n int, srv *httptest.Server) http.Handler {
 	hits := struct {
 		Hits int `json:"hits"`
 	}{}
-	writeJSON := func(w http.ResponseWriter, v interface{}) {
+	writeJSON := func(w http.ResponseWriter, v any) {
 		b, err := json.Marshal(v)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1089,8 +1127,7 @@ func generateJWKServer(n int) *httptest.Server {
 	}
 
 	defaultKeySet := must(generateJSONWebKeySet(n))[0].(jose.JSONWebKeySet)
-	srv := httptest.NewUnstartedServer(nil)
-	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Hits++
 		switch r.RequestURI {
 		case "/error":
@@ -1116,8 +1153,19 @@ func generateJWKServer(n int) *httptest.Server {
 			writeJSON(w, getPublic(defaultKeySet))
 		}
 	})
+}
 
+func generateJWKServer(n int) *httptest.Server {
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config.Handler = generateJWKServerHandler(n, srv)
 	srv.Start()
+	return srv
+}
+
+func generateTLSJWKServer(n int) *httptest.Server {
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config.Handler = generateJWKServerHandler(n, srv)
+	srv.StartTLS()
 	return srv
 }
 

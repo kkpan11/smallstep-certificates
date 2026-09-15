@@ -13,15 +13,17 @@ import (
 	"unicode"
 
 	"github.com/pkg/errors"
+	"github.com/urfave/cli"
+
+	"github.com/smallstep/cli-utils/errs"
+	"github.com/smallstep/cli-utils/step"
+
 	"github.com/smallstep/certificates/acme"
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/pki"
-	"github.com/urfave/cli"
-	"go.step.sm/cli-utils/errs"
-	"go.step.sm/cli-utils/step"
 )
 
 // AppCommand is the action used as the top action.
@@ -83,6 +85,10 @@ Requires **--insecure** flag.`,
 			Usage: `the <port> used on tls-alpn-01 challenges. It can be changed for testing purposes.
 Requires **--insecure** flag.`,
 		},
+		cli.BoolFlag{
+			Name:  "acme-strict-fqdn",
+			Usage: `enable strict DNS resolution using a fully qualified domain name.`,
+		},
 		cli.StringFlag{
 			Name:  "pidfile",
 			Usage: "the path to the <file> to write the process ID.",
@@ -125,6 +131,9 @@ func appAction(ctx *cli.Context) error {
 			return fmt.Errorf("flag '--acme-tls-port' requires the '--insecure' flag")
 		}
 	}
+
+	// Set the strict DNS resolution on ACME challenges. Defaults to false.
+	acme.StrictFQDN = ctx.Bool("acme-strict-fqdn")
 
 	// Allow custom contexts.
 	if caCtx := ctx.String("context"); caCtx != "" {
@@ -188,7 +197,7 @@ func appAction(ctx *cli.Context) error {
 			return errors.New(`'step-ca' requires the '--token' flag for linked deploy type.
 
 To get a linked authority token:
-  1. Log in or create a Certificate Manager account at ` + "\033[1mhttps://u.step.sm/linked\033[0m" + `
+  1. Contact us at ` + "\033[1mhttps://u.step.sm/cm\033[0m" + ` to create a new Certificate Manager account
   2. Add a new authority and select "Link a step-ca instance"
   3. Follow instructions in browser to start 'step-ca' using the '--token' flag
 `)

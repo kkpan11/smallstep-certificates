@@ -2,22 +2,20 @@ package provisioner
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"net/http"
 
 	"github.com/pkg/errors"
 
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/sshutil"
 	"go.step.sm/crypto/x509util"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/certificates/internal/cryptoutil"
 )
 
 // NOTE: There can be at most one kubernetes service account provisioner configured
@@ -52,7 +50,7 @@ type K8sSA struct {
 	Claims  *Claims  `json:"claims,omitempty"`
 	Options *Options `json:"options,omitempty"`
 	//kauthn    kauthn.AuthenticationV1Interface
-	pubKeys []interface{}
+	pubKeys []any
 	ctl     *Controller
 }
 
@@ -73,7 +71,7 @@ func (p *K8sSA) GetIDForToken() string {
 
 // GetTokenID returns an unimplemented error and does not use the input ott.
 func (p *K8sSA) GetTokenID(string) (string, error) {
-	return "", errors.New("not implemented")
+	return "", ErrNotImplemented
 }
 
 // GetName returns the name of the provisioner.
@@ -115,10 +113,8 @@ func (p *K8sSA) Init(config Config) (err error) {
 			if err != nil {
 				return errors.Wrapf(err, "error parsing public key in provisioner '%s'", p.GetName())
 			}
-			switch q := key.(type) {
-			case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
-			default:
-				return errors.Errorf("Unexpected public key type %T in provisioner '%s'", q, p.GetName())
+			if !cryptoutil.IsSupportedPublicKey(key) {
+				return errors.Errorf("Unexpected public key type %T in provisioner %q", key, p.GetName())
 			}
 			p.pubKeys = append(p.pubKeys, key)
 		}

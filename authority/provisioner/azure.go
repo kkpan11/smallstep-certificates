@@ -9,15 +9,16 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/sshutil"
 	"go.step.sm/crypto/x509util"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/webhook"
@@ -251,14 +252,14 @@ func (p *Azure) Init(config Config) (err error) {
 	p.assertConfig()
 
 	// Decode and validate openid-configuration endpoint
-	if err = getAndDecode(p.config.oidcDiscoveryURL, &p.oidcConfig); err != nil {
+	if err = getAndDecode(http.DefaultClient, p.config.oidcDiscoveryURL, &p.oidcConfig); err != nil {
 		return
 	}
 	if err := p.oidcConfig.Validate(); err != nil {
 		return errors.Wrapf(err, "error parsing %s", p.config.oidcDiscoveryURL)
 	}
 	// Get JWK key set
-	if p.keyStore, err = newKeyStore(p.oidcConfig.JWKSetURI); err != nil {
+	if p.keyStore, err = newKeyStore(http.DefaultClient, p.oidcConfig.JWKSetURI); err != nil {
 		return
 	}
 
@@ -325,11 +326,8 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 	// Filter by resource group
 	if len(p.ResourceGroups) > 0 {
 		var found bool
-		for _, g := range p.ResourceGroups {
-			if g == group {
-				found = true
-				break
-			}
+		if slices.Contains(p.ResourceGroups, group) {
+			found = true
 		}
 		if !found {
 			return nil, errs.Unauthorized("azure.AuthorizeSign; azure token validation failed - invalid resource group")
@@ -339,11 +337,8 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 	// Filter by subscription id
 	if len(p.SubscriptionIDs) > 0 {
 		var found bool
-		for _, s := range p.SubscriptionIDs {
-			if s == subscription {
-				found = true
-				break
-			}
+		if slices.Contains(p.SubscriptionIDs, subscription) {
+			found = true
 		}
 		if !found {
 			return nil, errs.Unauthorized("azure.AuthorizeSign; azure token validation failed - invalid subscription id")
@@ -353,11 +348,8 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 	// Filter by Azure AD identity object id
 	if len(p.ObjectIDs) > 0 {
 		var found bool
-		for _, i := range p.ObjectIDs {
-			if i == identityObjectID {
-				found = true
-				break
-			}
+		if slices.Contains(p.ObjectIDs, identityObjectID) {
+			found = true
 		}
 		if !found {
 			return nil, errs.Unauthorized("azure.AuthorizeSign; azure token validation failed - invalid identity object id")
@@ -379,7 +371,7 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 		// name will work only inside the virtual network
 		so = append(so,
 			commonNameValidator(name),
-			dnsNamesValidator([]string{name}),
+			dnsNamesSubsetValidator([]string{name}),
 			ipAddressesValidator(nil),
 			emailAddressesValidator(nil),
 			newURIsValidator(ctx, nil),

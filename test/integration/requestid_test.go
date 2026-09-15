@@ -50,7 +50,11 @@ func reservePort(t *testing.T) (host, port string) {
 }
 
 func Test_reflectRequestID(t *testing.T) {
+	ctx := context.Background()
+
 	dir := t.TempDir()
+	t.Setenv("STEPPATH", dir)
+
 	m, err := minica.New(minica.WithName("Step E2E"))
 	require.NoError(t, err)
 
@@ -125,16 +129,17 @@ func Test_reflectRequestID(t *testing.T) {
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		err = c.Run()
 		require.ErrorIs(t, err, http.ErrServerClosed)
-	}()
+	})
+
+	// require the CA server to be available within 10 seconds,
+	// failing the test if it doesn't.
+	requireCAServerToBeAvailable(t, net.JoinHostPort("localhost", port), 10*time.Second)
 
 	// require OK health response as the baseline
-	ctx := context.Background()
 	healthResponse, err := caClient.HealthWithContext(ctx)
 	require.NoError(t, err)
 	if assert.NotNil(t, healthResponse) {
@@ -146,11 +151,9 @@ func Test_reflectRequestID(t *testing.T) {
 	var firstErr *errs.Error
 	if assert.ErrorAs(t, err, &firstErr) {
 		assert.Equal(t, 404, firstErr.StatusCode())
-		assert.Equal(t, "The requested resource could not be found. Please see the certificate authority logs for more info.", firstErr.Err.Error())
+		assert.Equal(t, `root certificate with fingerprint "invalid" was not found`, firstErr.Err.Error())
 		assert.NotEmpty(t, firstErr.RequestID)
 
-		// TODO: include the below error in the JSON? It's currently only output to the CA logs. Also see https://github.com/smallstep/certificates/pull/759
-		//assert.Equal(t, "/root/invalid was not found: certificate with fingerprint invalid was not found", apiErr.Msg)
 	}
 	assert.Nil(t, rootResponse)
 
@@ -159,7 +162,7 @@ func Test_reflectRequestID(t *testing.T) {
 	var secondErr *errs.Error
 	if assert.ErrorAs(t, err, &secondErr) {
 		assert.Equal(t, 404, secondErr.StatusCode())
-		assert.Equal(t, "The requested resource could not be found. Please see the certificate authority logs for more info.", secondErr.Err.Error())
+		assert.Equal(t, `root certificate with fingerprint "invalid" was not found`, secondErr.Err.Error())
 		assert.Equal(t, "reqID", secondErr.RequestID)
 	}
 	assert.Nil(t, rootResponse)
@@ -262,8 +265,8 @@ func newAuthorizingServer(t *testing.T, mca *minica.CA) *httptest.Server {
 
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if assert.Equal(t, "signRequestID", r.Header.Get("X-Request-Id")) {
-			json.NewEncoder(w).Encode(struct{ Allow bool }{Allow: true})
-			w.WriteHeader(http.StatusOK)
+			err := json.NewEncoder(w).Encode(struct{ Allow bool }{Allow: true})
+			require.NoError(t, err)
 			return
 		}
 
@@ -286,4 +289,34 @@ func newAuthorizingServer(t *testing.T, mca *minica.CA) *httptest.Server {
 	}
 
 	return srv
+}
+
+// requireCAServerToBeAvailable tries to connect to address to check a server
+// is available. It will retry the connection every ~100ms, until timeout occurs.
+// If no connection can be made, the test is failed.
+func requireCAServerToBeAvailable(t *testing.T, address string, timeout time.Duration) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for !canConnect(ctx, address) {
+		select {
+		case <-ctx.Done():
+			require.FailNow(t, fmt.Sprintf("CA server failed to start at https://%s within %s", address, timeout.String()))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func canConnect(ctx context.Context, address string) bool {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return false
+	}
+
+	conn.Close()
+
+	return true
 }

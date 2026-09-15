@@ -13,6 +13,7 @@ import (
 	kmsapi "go.step.sm/crypto/kms/apiv1"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/smallstep/certificates/authority/provisioner/androidkey"
 	"github.com/smallstep/certificates/errs"
 )
 
@@ -32,6 +33,13 @@ type Interface interface {
 	AuthorizeSSHRevoke(ctx context.Context, token string) error
 	AuthorizeSSHRenew(ctx context.Context, token string) (*ssh.Certificate, error)
 	AuthorizeSSHRekey(ctx context.Context, token string) (*ssh.Certificate, []SignOption, error)
+}
+
+// HTTPClient is the interface implemented by the HTTP clients used by the
+// provisioners.
+type HTTPClient interface {
+	Get(string) (*http.Response, error)
+	Do(*http.Request) (*http.Response, error)
 }
 
 // Uninitialized represents a disabled provisioner. Uninitialized provisioners
@@ -69,6 +77,13 @@ func (p Uninitialized) MarshalJSON() ([]byte, error) {
 // token. Therefore, for the Azure provisioner we are enabling token reuse, with
 // the understanding that we are not following security best practices
 var ErrAllowTokenReuse = stderrors.New("allow token reuse")
+
+// ErrTokenFlowNotSupported is an error that is returned by provisioners on
+// GetTokenID when the use of tokens is not supported.
+var ErrTokenFlowNotSupported = stderrors.New("token flow is not supported")
+
+// ErrNotImplemented is an error returned when one method is not implemented.
+var ErrNotImplemented = stderrors.New("not implemented")
 
 // Audiences stores all supported audiences by request type.
 type Audiences struct {
@@ -246,7 +261,7 @@ type Config struct {
 	Claims Claims
 	// Audiences are the audiences used in the default provisioner, (JWK).
 	Audiences Audiences
-	// SSHKeys are the root SSH public keys
+	// SSHKeys are the root SSH public keys.
 	SSHKeys *SSHKeys
 	// GetIdentityFunc is a function that returns an identity that will be
 	// used by the provisioner to populate certificate attributes.
@@ -257,10 +272,20 @@ type Config struct {
 	// AuthorizeSSHRenewFunc is a function that returns nil if a given SSH
 	// certificate can be renewed.
 	AuthorizeSSHRenewFunc AuthorizeSSHRenewFunc
-	// WebhookClient is an http client to use in webhook request
-	WebhookClient *http.Client
+	// WebhookClient is an HTTP client used when performing webhook requests.
+	WebhookClient HTTPClient
 	// SCEPKeyManager, if defined, is the interface used by SCEP provisioners.
 	SCEPKeyManager SCEPKeyManager
+	// HTTPClient is an HTTP client that trusts the system cert pool and the CA
+	// roots.
+	HTTPClient HTTPClient
+	// WrapTransport references the function that should wrap any [http.Transport] initialized
+	// down the Config's chain.
+	WrapTransport TransportWrapper
+	// AndroidKeyCRLChecker references an implementation of [androidkey.CRLChecker]
+	// that is responsible for checking revoked Android Key Attestation certificate
+	// serial numbers.
+	AndroidKeyCRLChecker androidkey.CRLChecker
 }
 
 type provisioner struct {
@@ -402,7 +427,7 @@ func (p *raProvisioner) RAInfo() *RAInfo {
 
 // MockProvisioner for testing
 type MockProvisioner struct {
-	Mret1, Mret2, Mret3 interface{}
+	Mret1, Mret2, Mret3 any
 	Merr                error
 	MgetID              func() string
 	MgetIDForToken      func() string

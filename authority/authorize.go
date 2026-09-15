@@ -16,8 +16,8 @@ import (
 	"github.com/smallstep/certificates/authority/admin"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
-	"go.step.sm/linkedca"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -93,7 +93,7 @@ func (a *Authority) authorizeToken(ctx context.Context, token string) (provision
 	// Store the token to protect against reuse unless it's skipped.
 	// If we cannot get a token id from the provisioner, just hash the token.
 	if !SkipTokenReuseFromContext(ctx) {
-		if err := a.UseToken(token, p); err != nil {
+		if err := a.UseToken(ctx, token, p); err != nil {
 			return nil, err
 		}
 	}
@@ -138,7 +138,7 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	}
 
 	// Check that the token has not been used.
-	if err := a.UseToken(token, prov); err != nil {
+	if err := a.UseToken(r.Context(), token, prov); err != nil {
 		return nil, admin.WrapError(admin.ErrorUnauthorizedType, err, "adminHandler.authorizeToken; error with reuse token")
 	}
 
@@ -193,29 +193,42 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 
 // UseToken stores the token to protect against reuse.
 //
-// This method currently ignores any error coming from the GetTokenID, but it
-// should specifically ignore the error provisioner.ErrAllowTokenReuse.
-func (a *Authority) UseToken(token string, prov provisioner.Interface) error {
-	if reuseKey, err := prov.GetTokenID(token); err == nil {
-		if reuseKey == "" {
-			sum := sha256.Sum256([]byte(token))
-			reuseKey = strings.ToLower(hex.EncodeToString(sum[:]))
+// This method currently ignores most errors coming from the GetTokenID because
+// the token is already validated. But it should specifically ignore the errors
+// provisioner.ErrAllowTokenReuse, provisioner.ErrNotImplemented, and
+// provisioner.ErrTokenFlowNotSupported unless this latter one used in a renewal
+// flow without mTLS.
+func (a *Authority) UseToken(ctx context.Context, token string, prov provisioner.Interface) error {
+	reuseKey, err := prov.GetTokenID(token)
+	if err != nil {
+		// Fail on ErrTokenFlowNotSupported but allow x5cInsecure renew token
+		if errors.Is(err, provisioner.ErrTokenFlowNotSupported) && provisioner.RenewMethod != provisioner.MethodFromContext(ctx) {
+			return errs.BadRequest("token flow is not supported")
 		}
-		ok, err := a.db.UseToken(reuseKey, token)
-		if err != nil {
-			return errs.Wrap(http.StatusInternalServerError, err, "failed when attempting to store token")
-		}
-		if !ok {
-			return errs.Unauthorized("token already used")
-		}
+
+		return nil
 	}
+
+	if reuseKey == "" {
+		sum := sha256.Sum256([]byte(token))
+		reuseKey = strings.ToLower(hex.EncodeToString(sum[:]))
+	}
+
+	ok, err := a.db.UseToken(reuseKey, token)
+	if err != nil {
+		return errs.Wrap(http.StatusInternalServerError, err, "failed when attempting to store token")
+	}
+	if !ok {
+		return errs.Unauthorized("token already used")
+	}
+
 	return nil
 }
 
 // Authorize grabs the method from the context and authorizes the request by
 // validating the one-time-token.
 func (a *Authority) Authorize(ctx context.Context, token string) ([]provisioner.SignOption, error) {
-	var opts = []interface{}{errs.WithKeyVal("token", token)}
+	var opts = []any{errs.WithKeyVal("token", token)}
 
 	switch m := provisioner.MethodFromContext(ctx); m {
 	case provisioner.SignMethod, provisioner.SignIdentityMethod:
@@ -244,7 +257,7 @@ func (a *Authority) Authorize(ctx context.Context, token string) ([]provisioner.
 		_, signOpts, err := a.authorizeSSHRekey(ctx, token)
 		return signOpts, errs.Wrap(http.StatusInternalServerError, err, "authority.Authorize", opts...)
 	default:
-		return nil, errs.InternalServer("authority.Authorize; method %d is not supported", append([]interface{}{m}, opts...)...)
+		return nil, errs.InternalServer("authority.Authorize; method %d is not supported", append([]any{m}, opts...)...)
 	}
 }
 
@@ -292,7 +305,7 @@ func (a *Authority) authorizeRevoke(ctx context.Context, token string) error {
 // TODO(mariano): should we authorize by default?
 func (a *Authority) authorizeRenew(ctx context.Context, cert *x509.Certificate) (provisioner.Interface, error) {
 	serial := cert.SerialNumber.String()
-	var opts = []interface{}{errs.WithKeyVal("serialNumber", serial)}
+	var opts = []any{errs.WithKeyVal("serialNumber", serial)}
 
 	isRevoked, err := a.IsRevoked(serial)
 	if err != nil {
@@ -398,7 +411,7 @@ func (a *Authority) authorizeSSHRevoke(ctx context.Context, token string) error 
 
 // AuthorizeRenewToken validates the renew token and returns the leaf
 // certificate in the x5cInsecure header.
-func (a *Authority) AuthorizeRenewToken(_ context.Context, ott string) (*x509.Certificate, error) {
+func (a *Authority) AuthorizeRenewToken(ctx context.Context, ott string) (*x509.Certificate, error) {
 	var claims jose.Claims
 	jwt, chain, err := jose.ParseX5cInsecure(ott, a.rootX509Certs)
 	if err != nil {
@@ -413,7 +426,7 @@ func (a *Authority) AuthorizeRenewToken(_ context.Context, ott string) (*x509.Ce
 	if err != nil {
 		return nil, errs.Unauthorized("error validating renew token: cannot get provisioner from certificate")
 	}
-	if err := a.UseToken(ott, p); err != nil {
+	if err := a.UseToken(ctx, ott, p); err != nil {
 		return nil, err
 	}
 

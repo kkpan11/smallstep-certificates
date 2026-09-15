@@ -22,22 +22,27 @@ import (
 	"net"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-tpm/legacy/tpm2"
-	"golang.org/x/exp/slices"
 
+	attestation "github.com/smallstep/android-attestation"
 	"github.com/smallstep/go-attestation/attest"
-
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/keyutil"
+	"go.step.sm/crypto/mldsa"
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/x509util"
 
+	"github.com/smallstep/certificates/acme/wire"
 	"github.com/smallstep/certificates/authority/provisioner"
+	wireprovisioner "github.com/smallstep/certificates/authority/provisioner/wire"
+	"github.com/smallstep/certificates/internal/cast"
 )
 
 type ChallengeType string
@@ -51,6 +56,10 @@ const (
 	TLSALPN01 ChallengeType = "tls-alpn-01"
 	// DEVICEATTEST01 is the device-attest-01 ACME challenge type
 	DEVICEATTEST01 ChallengeType = "device-attest-01"
+	// WIREOIDC01 is the Wire OIDC challenge type
+	WIREOIDC01 ChallengeType = "wire-oidc-01"
+	// WIREDPOP01 is the Wire DPoP challenge type
+	WIREDPOP01 ChallengeType = "wire-dpop-01"
 )
 
 var (
@@ -63,6 +72,11 @@ var (
 	//
 	// This variable can be used for testing purposes.
 	InsecurePortTLSALPN01 int
+
+	// StrictFQDN allows to enforce a fully qualified domain name in the DNS
+	// resolution. By default it allows domain resolution using a search list
+	// defined in the resolv.conf or similar configuration.
+	StrictFQDN bool
 )
 
 // Challenge represents an ACME response Challenge type.
@@ -76,11 +90,14 @@ type Challenge struct {
 	Token           string        `json:"token"`
 	ValidatedAt     string        `json:"validated,omitempty"`
 	URL             string        `json:"url"`
+	Target          string        `json:"target,omitempty"`
 	Error           *Error        `json:"error,omitempty"`
+	Payload         []byte        `json:"-"`
+	PayloadFormat   string        `json:"-"`
 }
 
 // ToLog enables response logging.
-func (ch *Challenge) ToLog() (interface{}, error) {
+func (ch *Challenge) ToLog() (any, error) {
 	b, err := json.Marshal(ch)
 	if err != nil {
 		return nil, WrapErrorISE(err, "error marshaling challenge for logging")
@@ -105,8 +122,20 @@ func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, 
 		return tlsalpn01Validate(ctx, ch, db, jwk)
 	case DEVICEATTEST01:
 		return deviceAttest01Validate(ctx, ch, db, jwk, payload)
+	case WIREOIDC01:
+		wireDB, ok := db.(WireDB)
+		if !ok {
+			return NewErrorISE("db %T is not a WireDB", db)
+		}
+		return wireOIDC01Validate(ctx, ch, wireDB, jwk, payload)
+	case WIREDPOP01:
+		wireDB, ok := db.(WireDB)
+		if !ok {
+			return NewErrorISE("db %T is not a WireDB", db)
+		}
+		return wireDPOP01Validate(ctx, ch, wireDB, jwk, payload)
 	default:
-		return NewErrorISE("unexpected challenge type '%s'", ch.Type)
+		return NewErrorISE("unexpected challenge type %q", ch.Type)
 	}
 }
 
@@ -163,8 +192,10 @@ func http01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWeb
 
 // rootedName adds a trailing "." to a given domain name.
 func rootedName(name string) string {
-	if name == "" || name[len(name)-1] != '.' {
-		return name + "."
+	if StrictFQDN {
+		if name == "" || name[len(name)-1] != '.' {
+			return name + "."
+		}
 	}
 	return name
 }
@@ -198,11 +229,10 @@ func dns01ChallengeHost(domain string) string {
 }
 
 func tlsAlert(err error) uint8 {
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
 		v := reflect.ValueOf(opErr.Err)
 		if v.Kind() == reflect.Uint8 {
-			return uint8(v.Uint())
+			return cast.Uint8(v.Uint())
 		}
 	}
 	return 0
@@ -348,11 +378,8 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 	h := sha256.Sum256([]byte(expectedKeyAuth))
 	expected := base64.RawURLEncoding.EncodeToString(h[:])
 	var found bool
-	for _, r := range txtRecords {
-		if r == expected {
-			found = true
-			break
-		}
+	if slices.Contains(txtRecords, expected) {
+		found = true
 	}
 	if !found {
 		return storeError(ctx, db, ch, false, NewError(ErrorRejectedIdentifierType,
@@ -370,18 +397,402 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 	return nil
 }
 
+type wireOidcPayload struct {
+	// IDToken contains the OIDC identity token
+	IDToken string `json:"id_token"`
+}
+
+func wireOIDC01Validate(ctx context.Context, ch *Challenge, db WireDB, jwk *jose.JSONWebKey, payload []byte) error {
+	prov, ok := ProvisionerFromContext(ctx)
+	if !ok {
+		return NewErrorISE("missing provisioner")
+	}
+	wireOptions, err := prov.GetOptions().GetWireOptions()
+	if err != nil {
+		return WrapErrorISE(err, "failed getting Wire options")
+	}
+	linker, ok := LinkerFromContext(ctx)
+	if !ok {
+		return NewErrorISE("missing linker")
+	}
+
+	var oidcPayload wireOidcPayload
+	if err := json.Unmarshal(payload, &oidcPayload); err != nil {
+		return WrapError(ErrorMalformedType, err, "error unmarshalling Wire OIDC challenge payload")
+	}
+
+	wireID, err := wire.ParseUserID(ch.Value)
+	if err != nil {
+		return WrapErrorISE(err, "error unmarshalling challenge data")
+	}
+
+	oidcOptions := wireOptions.GetOIDCOptions()
+	verifier, err := oidcOptions.GetVerifier(ctx)
+	if err != nil {
+		return WrapErrorISE(err, "no OIDC verifier available")
+	}
+
+	idToken, err := verifier.Verify(ctx, oidcPayload.IDToken)
+	if err != nil {
+		return storeError(ctx, db, ch, true, WrapError(ErrorRejectedIdentifierType, err,
+			"error verifying ID token signature"))
+	}
+
+	var claims struct {
+		Name         string `json:"preferred_username,omitempty"`
+		Handle       string `json:"name"`
+		Issuer       string `json:"iss,omitempty"`
+		GivenName    string `json:"given_name,omitempty"`
+		KeyAuth      string `json:"keyauth"`
+		ACMEAudience string `json:"acme_aud,omitempty"`
+	}
+	if err := idToken.Claims(&claims); err != nil {
+		return storeError(ctx, db, ch, true, WrapError(ErrorRejectedIdentifierType, err,
+			"error retrieving claims from ID token"))
+	}
+
+	// TODO(hs): move this into validation below?
+	expectedKeyAuth, err := KeyAuthorization(ch.Token, jwk)
+	if err != nil {
+		return WrapErrorISE(err, "error determining key authorization")
+	}
+	if expectedKeyAuth != claims.KeyAuth {
+		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+			"keyAuthorization does not match; expected %q, but got %q", expectedKeyAuth, claims.KeyAuth))
+	}
+
+	// audience is the full URL to the challenge
+	acmeAudience := linker.GetLink(ctx, ChallengeLinkType, ch.AuthorizationID, ch.ID)
+	if claims.ACMEAudience != acmeAudience {
+		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+			"invalid 'acme_aud' %q", claims.ACMEAudience))
+	}
+
+	transformedIDToken, err := validateWireOIDCClaims(oidcOptions, idToken, wireID)
+	if err != nil {
+		return storeError(ctx, db, ch, true, WrapError(ErrorRejectedIdentifierType, err, "claims in OIDC ID token don't match"))
+	}
+
+	// Update and store the challenge.
+	ch.Status = StatusValid
+	ch.Error = nil
+	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+
+	if err = db.UpdateChallenge(ctx, ch); err != nil {
+		return WrapErrorISE(err, "error updating challenge")
+	}
+
+	orders, err := db.GetAllOrdersByAccountID(ctx, ch.AccountID)
+	if err != nil {
+		return WrapErrorISE(err, "could not retrieve current order by account id")
+	}
+	if len(orders) == 0 {
+		return NewErrorISE("there are not enough orders for this account for this custom OIDC challenge")
+	}
+
+	order := orders[len(orders)-1]
+	if err := db.CreateOidcToken(ctx, order, transformedIDToken); err != nil {
+		return WrapErrorISE(err, "failed storing OIDC id token")
+	}
+
+	return nil
+}
+
+func validateWireOIDCClaims(o *wireprovisioner.OIDCOptions, token *oidc.IDToken, wireID wire.UserID) (map[string]any, error) {
+	var m map[string]any
+	if err := token.Claims(&m); err != nil {
+		return nil, fmt.Errorf("failed extracting OIDC ID token claims: %w", err)
+	}
+	transformed, err := o.Transform(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed transforming OIDC ID token: %w", err)
+	}
+
+	name, ok := transformed["name"]
+	if !ok {
+		return nil, fmt.Errorf("transformed OIDC ID token does not contain 'name'")
+	}
+	if wireID.Name != name {
+		return nil, fmt.Errorf("invalid 'name' %q after transformation", name)
+	}
+
+	preferredUsername, ok := transformed["preferred_username"]
+	if !ok {
+		return nil, fmt.Errorf("transformed OIDC ID token does not contain 'preferred_username'")
+	}
+	if wireID.Handle != preferredUsername {
+		return nil, fmt.Errorf("invalid 'preferred_username' %q after transformation", preferredUsername)
+	}
+
+	return transformed, nil
+}
+
+type wireDpopPayload struct {
+	// AccessToken is the token generated by wire-server
+	AccessToken string `json:"access_token"`
+}
+
+func wireDPOP01Validate(ctx context.Context, ch *Challenge, db WireDB, accountJWK *jose.JSONWebKey, payload []byte) error {
+	prov, ok := ProvisionerFromContext(ctx)
+	if !ok {
+		return NewErrorISE("missing provisioner")
+	}
+	wireOptions, err := prov.GetOptions().GetWireOptions()
+	if err != nil {
+		return WrapErrorISE(err, "failed getting Wire options")
+	}
+	linker, ok := LinkerFromContext(ctx)
+	if !ok {
+		return NewErrorISE("missing linker")
+	}
+
+	var dpopPayload wireDpopPayload
+	if err := json.Unmarshal(payload, &dpopPayload); err != nil {
+		return WrapError(ErrorMalformedType, err, "error unmarshalling Wire DPoP challenge payload")
+	}
+
+	wireID, err := wire.ParseDeviceID(ch.Value)
+	if err != nil {
+		return WrapErrorISE(err, "error unmarshalling challenge data")
+	}
+
+	clientID, err := wire.ParseClientID(wireID.ClientID)
+	if err != nil {
+		return WrapErrorISE(err, "error parsing device id")
+	}
+
+	dpopOptions := wireOptions.GetDPOPOptions()
+	issuer, err := dpopOptions.EvaluateTarget(clientID.DeviceID)
+	if err != nil {
+		return WrapErrorISE(err, "invalid Go template registered for 'target'")
+	}
+
+	// audience is the full URL to the challenge
+	audience := linker.GetLink(ctx, ChallengeLinkType, ch.AuthorizationID, ch.ID)
+
+	params := wireVerifyParams{
+		token:     dpopPayload.AccessToken,
+		tokenKey:  dpopOptions.GetSigningKey(),
+		dpopKey:   accountJWK.Public(),
+		dpopKeyID: accountJWK.KeyID,
+		issuer:    issuer,
+		audience:  audience,
+		wireID:    wireID,
+		chToken:   ch.Token,
+		t:         clock.Now().UTC(),
+	}
+	_, dpop, err := parseAndVerifyWireAccessToken(params)
+	if err != nil {
+		return storeError(ctx, db, ch, true, WrapError(ErrorRejectedIdentifierType, err,
+			"failed validating Wire access token"))
+	}
+
+	// Update and store the challenge.
+	ch.Status = StatusValid
+	ch.Error = nil
+	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+
+	if err = db.UpdateChallenge(ctx, ch); err != nil {
+		return WrapErrorISE(err, "error updating challenge")
+	}
+
+	orders, err := db.GetAllOrdersByAccountID(ctx, ch.AccountID)
+	if err != nil {
+		return WrapErrorISE(err, "could not find current order by account id")
+	}
+	if len(orders) == 0 {
+		return NewErrorISE("there are not enough orders for this account for this custom OIDC challenge")
+	}
+
+	order := orders[len(orders)-1]
+	if err := db.CreateDpopToken(ctx, order, map[string]any(*dpop)); err != nil {
+		return WrapErrorISE(err, "failed storing DPoP token")
+	}
+
+	return nil
+}
+
+type wireCnf struct {
+	Kid string `json:"kid"`
+}
+
+type wireAccessToken struct {
+	jose.Claims
+	Challenge  string  `json:"chal"`
+	Nonce      string  `json:"nonce"`
+	Cnf        wireCnf `json:"cnf"`
+	Proof      string  `json:"proof"`
+	ClientID   string  `json:"client_id"`
+	APIVersion int     `json:"api_version"`
+	Scope      string  `json:"scope"`
+}
+
+type wireDpopJwt struct {
+	jose.Claims
+	ClientID  string `json:"client_id"`
+	Challenge string `json:"chal"`
+	Nonce     string `json:"nonce"`
+	HTU       string `json:"htu"`
+}
+
+type wireDpopToken map[string]any
+
+type wireVerifyParams struct {
+	token     string
+	tokenKey  crypto.PublicKey
+	dpopKey   crypto.PublicKey
+	dpopKeyID string
+	issuer    string
+	audience  string
+	wireID    wire.DeviceID
+	chToken   string
+	t         time.Time
+}
+
+func parseAndVerifyWireAccessToken(v wireVerifyParams) (*wireAccessToken, *wireDpopToken, error) {
+	jwt, err := jose.ParseSigned(v.token)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed parsing token: %w", err)
+	}
+
+	if len(jwt.Headers) != 1 {
+		return nil, nil, fmt.Errorf("token has wrong number of headers %d", len(jwt.Headers))
+	}
+	keyID, err := KeyToID(&jose.JSONWebKey{Key: v.tokenKey})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed calculating token key ID: %w", err)
+	}
+	jwtKeyID := jwt.Headers[0].KeyID
+	if jwtKeyID == "" {
+		if jwtKeyID, err = KeyToID(jwt.Headers[0].JSONWebKey); err != nil {
+			return nil, nil, fmt.Errorf("failed extracting token key ID: %w", err)
+		}
+	}
+	if jwtKeyID != keyID {
+		return nil, nil, fmt.Errorf("invalid token key ID %q", jwtKeyID)
+	}
+
+	var accessToken wireAccessToken
+	if err = jwt.Claims(v.tokenKey, &accessToken); err != nil {
+		return nil, nil, fmt.Errorf("failed validating Wire DPoP token claims: %w", err)
+	}
+
+	if err := accessToken.ValidateWithLeeway(jose.Expected{
+		Time:     v.t,
+		Issuer:   v.issuer,
+		Audience: jose.Audience{v.audience},
+	}, 1*time.Minute); err != nil {
+		return nil, nil, fmt.Errorf("failed validation: %w", err)
+	}
+
+	if accessToken.Challenge == "" {
+		return nil, nil, errors.New("access token challenge 'chal' must not be empty")
+	}
+	if accessToken.Cnf.Kid == "" || accessToken.Cnf.Kid != v.dpopKeyID {
+		return nil, nil, fmt.Errorf("expected 'kid' %q; got %q", v.dpopKeyID, accessToken.Cnf.Kid)
+	}
+	if accessToken.ClientID != v.wireID.ClientID {
+		return nil, nil, fmt.Errorf("invalid Wire 'client_id' %q", accessToken.ClientID)
+	}
+	if accessToken.Expiry.Time().After(v.t.Add(time.Hour)) {
+		return nil, nil, fmt.Errorf("token expiry 'exp' %s is too far into the future", accessToken.Expiry.Time().String())
+	}
+	if accessToken.Scope != "wire_client_id" {
+		return nil, nil, fmt.Errorf("invalid Wire 'scope' %q", accessToken.Scope)
+	}
+
+	dpopJWT, err := jose.ParseSigned(accessToken.Proof)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid Wire DPoP token: %w", err)
+	}
+	if len(dpopJWT.Headers) != 1 {
+		return nil, nil, fmt.Errorf("DPoP token has wrong number of headers %d", len(jwt.Headers))
+	}
+	dpopJwtKeyID := dpopJWT.Headers[0].KeyID
+	if dpopJwtKeyID == "" {
+		if dpopJwtKeyID, err = KeyToID(dpopJWT.Headers[0].JSONWebKey); err != nil {
+			return nil, nil, fmt.Errorf("failed extracting DPoP token key ID: %w", err)
+		}
+	}
+	if dpopJwtKeyID != v.dpopKeyID {
+		return nil, nil, fmt.Errorf("invalid DPoP token key ID %q", dpopJWT.Headers[0].KeyID)
+	}
+
+	var wireDpop wireDpopJwt
+	if err := dpopJWT.Claims(v.dpopKey, &wireDpop); err != nil {
+		return nil, nil, fmt.Errorf("failed validating Wire DPoP token claims: %w", err)
+	}
+
+	if err := wireDpop.ValidateWithLeeway(jose.Expected{
+		Time:     v.t,
+		Audience: jose.Audience{v.audience},
+	}, 1*time.Minute); err != nil {
+		return nil, nil, fmt.Errorf("failed DPoP validation: %w", err)
+	}
+	if wireDpop.HTU == "" || wireDpop.HTU != v.issuer { // DPoP doesn't contains "iss" claim, but has it in the "htu" claim
+		return nil, nil, fmt.Errorf("DPoP contains invalid issuer 'htu' %q", wireDpop.HTU)
+	}
+	if wireDpop.Expiry.Time().After(v.t.Add(time.Hour)) {
+		return nil, nil, fmt.Errorf("'exp' %s is too far into the future", wireDpop.Expiry.Time().String())
+	}
+	if wireDpop.Subject != v.wireID.ClientID {
+		return nil, nil, fmt.Errorf("DPoP contains invalid Wire client ID %q", wireDpop.ClientID)
+	}
+	if wireDpop.Nonce == "" || wireDpop.Nonce != accessToken.Nonce {
+		return nil, nil, fmt.Errorf("DPoP contains invalid 'nonce' %q", wireDpop.Nonce)
+	}
+	if wireDpop.Challenge == "" || wireDpop.Challenge != accessToken.Challenge {
+		return nil, nil, fmt.Errorf("DPoP contains invalid challenge 'chal' %q", wireDpop.Challenge)
+	}
+
+	// TODO(hs): can we use the wireDpopJwt and map that instead of doing Claims() twice?
+	var dpopToken wireDpopToken
+	if err := dpopJWT.Claims(v.dpopKey, &dpopToken); err != nil {
+		return nil, nil, fmt.Errorf("failed validating Wire DPoP token claims: %w", err)
+	}
+
+	challenge, ok := dpopToken["chal"].(string)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid challenge 'chal' in Wire DPoP token")
+	}
+	if challenge == "" || challenge != v.chToken {
+		return nil, nil, fmt.Errorf("invalid Wire DPoP challenge 'chal' %q", challenge)
+	}
+
+	handle, ok := dpopToken["handle"].(string)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid 'handle' in Wire DPoP token")
+	}
+	if handle == "" || handle != v.wireID.Handle {
+		return nil, nil, fmt.Errorf("invalid Wire client 'handle' %q", handle)
+	}
+
+	name, ok := dpopToken["name"].(string)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid display 'name' in Wire DPoP token")
+	}
+	if name == "" || name != v.wireID.Name {
+		return nil, nil, fmt.Errorf("invalid Wire client display 'name' %q", name)
+	}
+
+	return &accessToken, &dpopToken, nil
+}
+
 type payloadType struct {
 	AttObj string `json:"attObj"`
 	Error  string `json:"error"`
 }
 
 type attestationObject struct {
-	Format       string                 `json:"fmt"`
-	AttStatement map[string]interface{} `json:"attStmt,omitempty"`
+	Format       string         `json:"fmt"`
+	AttStatement map[string]any `json:"attStmt,omitempty"`
 }
 
 // TODO(bweeks): move attestation verification to a shared package.
 func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey, payload []byte) error {
+	// Update challenge with the payload
+	ch.Payload = payload
+
 	// Load authorization to store the key fingerprint.
 	az, err := db.GetAuthorization(ctx, ch.AuthorizationID)
 	if err != nil {
@@ -425,7 +836,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 	format := att.Format
 	prov := MustProvisionerFromContext(ctx)
 	if !prov.IsAttestationFormatEnabled(ctx, provisioner.ACMEAttestationFormat(format)) {
-		if format != "apple" && format != "step" && format != "tpm" {
+		if format != "apple" && format != "step" && format != "tpm" && format != "android-key" {
 			return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "unsupported attestation object format %q", format))
 		}
 
@@ -434,11 +845,39 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 	}
 
 	switch format {
+	case "android-key":
+		data, err := doAndroidKeyAttestationFormat(ctx, prov, ch, jwk, &att)
+		if err != nil {
+			if acmeError, ok := errors.AsType[*Error](err); ok {
+				if acmeError.Status == 500 {
+					return acmeError
+				}
+				return storeError(ctx, db, ch, true, acmeError)
+			}
+			return WrapErrorISE(err, "error validating attestation")
+		}
+
+		// Enforce hardware security level (TrustedEnvironment or StrongBox; Software not allowed)
+		if data.Attestation.AttestationSecurityLevel < 1 {
+			return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "insufficient security level: %d", data.Attestation.AttestationSecurityLevel))
+		}
+
+		// Enforce hardware backed device serial
+		if ch.Value != string(data.Attestation.TeeEnforced.AttestationIdSerial) {
+			subproblem := NewSubproblemWithIdentifier(
+				ErrorRejectedIdentifierType,
+				Identifier{Type: "permanent-identifier", Value: ch.Value},
+				"challenge identifier %q doesn't match any of the attested hardware identifiers %q", ch.Value, []string{string(data.Attestation.TeeEnforced.AttestationIdSerial)},
+			)
+			return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "permanent identifier does not match").AddSubproblems(subproblem))
+		}
+
+		// Update attestation key fingerprint to compare against the CSR
+		az.Fingerprint = data.Fingerprint
 	case "apple":
 		data, err := doAppleAttestationFormat(ctx, prov, ch, &att)
 		if err != nil {
-			var acmeError *Error
-			if errors.As(err, &acmeError) {
+			if acmeError, ok := errors.AsType[*Error](err); ok {
 				if acmeError.Status == 500 {
 					return acmeError
 				}
@@ -473,8 +912,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 	case "step":
 		data, err := doStepAttestationFormat(ctx, prov, ch, jwk, &att)
 		if err != nil {
-			var acmeError *Error
-			if errors.As(err, &acmeError) {
+			if acmeError, ok := errors.AsType[*Error](err); ok {
 				if acmeError.Status == 500 {
 					return acmeError
 				}
@@ -502,8 +940,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 	case "tpm":
 		data, err := doTPMAttestationFormat(ctx, prov, ch, jwk, &att)
 		if err != nil {
-			var acmeError *Error
-			if errors.As(err, &acmeError) {
+			if acmeError, ok := errors.AsType[*Error](err); ok {
 				if acmeError.Status == 500 {
 					return acmeError
 				}
@@ -536,6 +973,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 	ch.Status = StatusValid
 	ch.Error = nil
 	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+	ch.PayloadFormat = format
 
 	// Store the fingerprint in the authorization.
 	//
@@ -568,9 +1006,9 @@ type tpmAttestationData struct {
 type coseAlgorithmIdentifier int32
 
 const (
-	coseAlgES256 coseAlgorithmIdentifier = -7
-	coseAlgRS256 coseAlgorithmIdentifier = -257
-	coseAlgRS1   coseAlgorithmIdentifier = -65535 // deprecated, but (still) often used in TPMs
+	coseAlgES256 = coseAlgorithmIdentifier(-7)
+	coseAlgRS256 = coseAlgorithmIdentifier(-257)
+	coseAlgRS1   = coseAlgorithmIdentifier(-65535) // deprecated, but (still) often used in TPMs
 )
 
 func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, jwk *jose.JSONWebKey, att *attestationObject) (*tpmAttestationData, error) {
@@ -582,7 +1020,7 @@ func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, 
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "version %q is not supported", ver)
 	}
 
-	x5c, ok := att.AttStatement["x5c"].([]interface{})
+	x5c, ok := att.AttStatement["x5c"].([]any)
 	if !ok {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c not present")
 	}
@@ -695,8 +1133,13 @@ func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, 
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "invalid alg in attestation statement")
 	}
 
+	algI32, err := cast.SafeInt32(alg)
+	if err != nil {
+		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "invalid alg %d in attestation statement", alg)
+	}
+
 	var hash crypto.Hash
-	switch coseAlgorithmIdentifier(alg) {
+	switch coseAlgorithmIdentifier(algI32) {
 	case coseAlgRS256, coseAlgES256:
 		hash = crypto.SHA256
 	case coseAlgRS1:
@@ -831,7 +1274,7 @@ func validateAKCertificateExtendedKeyUsage(c *x509.Certificate) error {
 	)
 	for _, ext := range c.Extensions {
 		if ext.Id.Equal(oidExtensionExtendedKeyUsage) {
-			if _, err := asn1.Unmarshal(ext.Value, &ekus); err != nil || !ekus[0].Equal(oidTCGKpAIKCertificate) {
+			if _, err := asn1.Unmarshal(ext.Value, &ekus); err != nil || len(ekus) == 0 || !ekus[0].Equal(oidTCGKpAIKCertificate) {
 				return errors.New("AK certificate is missing Extended Key Usage value tcg-kp-AIKCertificate (2.23.133.8.3)")
 			}
 			valid = true
@@ -890,7 +1333,7 @@ func doAppleAttestationFormat(_ context.Context, prov Provisioner, _ *Challenge,
 		roots.AddCert(root)
 	}
 
-	x5c, ok := att.AttStatement["x5c"].([]interface{})
+	x5c, ok := att.AttStatement["x5c"].([]any)
 	if !ok {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c not present")
 	}
@@ -951,6 +1394,246 @@ func doAppleAttestationFormat(_ context.Context, prov Provisioner, _ *Challenge,
 	return data, nil
 }
 
+// Android RSA Root CA
+// https://developer.android.com/privacy-and-security/security-key-attestation#root_certificate
+var androidRSARootCA = `-----BEGIN CERTIFICATE-----
+MIIFHDCCAwSgAwIBAgIJAPHBcqaZ6vUdMA0GCSqGSIb3DQEBCwUAMBsxGTAXBgNV
+BAUTEGY5MjAwOWU4NTNiNmIwNDUwHhcNMjIwMzIwMTgwNzQ4WhcNNDIwMzE1MTgw
+NzQ4WjAbMRkwFwYDVQQFExBmOTIwMDllODUzYjZiMDQ1MIICIjANBgkqhkiG9w0B
+AQEFAAOCAg8AMIICCgKCAgEAr7bHgiuxpwHsK7Qui8xUFmOr75gvMsd/dTEDDJdS
+Sxtf6An7xyqpRR90PL2abxM1dEqlXnf2tqw1Ne4Xwl5jlRfdnJLmN0pTy/4lj4/7
+tv0Sk3iiKkypnEUtR6WfMgH0QZfKHM1+di+y9TFRtv6y//0rb+T+W8a9nsNL/ggj
+nar86461qO0rOs2cXjp3kOG1FEJ5MVmFmBGtnrKpa73XpXyTqRxB/M0n1n/W9nGq
+C4FSYa04T6N5RIZGBN2z2MT5IKGbFlbC8UrW0DxW7AYImQQcHtGl/m00QLVWutHQ
+oVJYnFPlXTcHYvASLu+RhhsbDmxMgJJ0mcDpvsC4PjvB+TxywElgS70vE0XmLD+O
+JtvsBslHZvPBKCOdT0MS+tgSOIfga+z1Z1g7+DVagf7quvmag8jfPioyKvxnK/Eg
+sTUVi2ghzq8wm27ud/mIM7AY2qEORR8Go3TVB4HzWQgpZrt3i5MIlCaY504LzSRi
+igHCzAPlHws+W0rB5N+er5/2pJKnfBSDiCiFAVtCLOZ7gLiMm0jhO2B6tUXHI/+M
+RPjy02i59lINMRRev56GKtcd9qO/0kUJWdZTdA2XoS82ixPvZtXQpUpuL12ab+9E
+aDK8Z4RHJYYfCT3Q5vNAXaiWQ+8PTWm2QgBR/bkwSWc+NpUFgNPN9PvQi8WEg5Um
+AGMCAwEAAaNjMGEwHQYDVR0OBBYEFDZh4QB8iAUJUYtEbEf/GkzJ6k8SMB8GA1Ud
+IwQYMBaAFDZh4QB8iAUJUYtEbEf/GkzJ6k8SMA8GA1UdEwEB/wQFMAMBAf8wDgYD
+VR0PAQH/BAQDAgIEMA0GCSqGSIb3DQEBCwUAA4ICAQB8cMqTllHc8U+qCrOlg3H7
+174lmaCsbo/bJ0C17JEgMLb4kvrqsXZs01U3mB/qABg/1t5Pd5AORHARs1hhqGIC
+W/nKMav574f9rZN4PC2ZlufGXb7sIdJpGiO9ctRhiLuYuly10JccUZGEHpHSYM2G
+tkgYbZba6lsCPYAAP83cyDV+1aOkTf1RCp/lM0PKvmxYN10RYsK631jrleGdcdkx
+oSK//mSQbgcWnmAEZrzHoF1/0gso1HZgIn0YLzVhLSA/iXCX4QT2h3J5z3znluKG
+1nv8NQdxei2DIIhASWfu804CA96cQKTTlaae2fweqXjdN1/v2nqOhngNyz1361mF
+mr4XmaKH/ItTwOe72NI9ZcwS1lVaCvsIkTDCEXdm9rCNPAY10iTunIHFXRh+7KPz
+lHGewCq/8TOohBRn0/NNfh7uRslOSZ/xKbN9tMBtw37Z8d2vvnXq/YWdsm1+JLVw
+n6yYD/yacNJBlwpddla8eaVMjsF6nBnIgQOf9zKSe06nSTqvgwUHosgOECZJZ1Eu
+zbH4yswbt02tKtKEFhx+v+OTge/06V+jGsqTWLsfrOCNLuA8H++z+pUENmpqnnHo
+vaI47gC+TNpkgYGkkBT6B/m/U01BuOBBTzhIlMEZq9qkDWuM2cA5kW5V3FJUcfHn
+w1IdYIg2Wxg7yHcQZemFQg==
+-----END CERTIFICATE-----`
+
+// Android ECDSA (secp384r1) Root CA
+var androidECDSARootCA = `-----BEGIN CERTIFICATE-----
+MIICIjCCAaigAwIBAgIRAISp0Cl7DrWK5/8OgN52BgUwCgYIKoZIzj0EAwMwUjEc
+MBoGA1UEAwwTS2V5IEF0dGVzdGF0aW9uIENBMTEQMA4GA1UECwwHQW5kcm9pZDET
+MBEGA1UECgwKR29vZ2xlIExMQzELMAkGA1UEBhMCVVMwHhcNMjUwNzE3MjIzMjE4
+WhcNMzUwNzE1MjIzMjE4WjBSMRwwGgYDVQQDDBNLZXkgQXR0ZXN0YXRpb24gQ0Ex
+MRAwDgYDVQQLDAdBbmRyb2lkMRMwEQYDVQQKDApHb29nbGUgTExDMQswCQYDVQQG
+EwJVUzB2MBAGByqGSM49AgEGBSuBBAAiA2IABCPaI3FO3z5bBQo8cuiEas4HjqCt
+G/mLFfRT0MsIssPBEEU5Cfbt6sH5yOAxqEi5QagpU1yX4HwnGb7OtBYpDTB57uH5
+Eczm34A5FNijV3s0/f0UPl7zbJcTx6xwqMIRq6NCMEAwDwYDVR0TAQH/BAUwAwEB
+/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFFIyuyz7RkOb3NaBqQ5lZuA0QepA
+MAoGCCqGSM49BAMDA2gAMGUCMETfjPO/HwqReR2CS7p0ZWoD/LHs6hDi422opifH
+EUaYLxwGlT9SLdjkVpz0UUOR5wIxAIoGyxGKRHVTpqpGRFiJtQEOOTp/+s1GcxeY
+uR2zh/80lQyu9vAFCj6E4AXc+osmRg==
+-----END CERTIFICATE-----`
+
+// OID for Android Key Attestation
+// https://source.android.com/docs/security/features/keystore/attestation#id-attestation
+var oidAndroidAttestation = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 1, 17}
+
+type androidKeyAttestationData struct {
+	Certificate *x509.Certificate
+	Fingerprint string
+	Attestation *attestation.KeyDescription
+}
+
+// findAndroidAttestationCert traverses the slice of [*x509.Certificate] from
+// end to start (root -> intermediate -> leaf) to locate the certificate closest
+// to the root carrying an Android Key Attestation extension.
+//
+// TODO(hs): implement the optional step of locating the provisioning information
+// extension? That should immediately precede the cert with the key attestation
+// extension.
+func findAndroidAttestationCert(certs []*x509.Certificate) *x509.Certificate {
+	for _, cert := range slices.Backward(certs) {
+		for _, ext := range cert.Extensions {
+			if ext.Id.Equal(oidAndroidAttestation) {
+				return cert
+			}
+		}
+	}
+
+	return nil
+}
+
+// doAndroidKeyAttestationFormat handles ACME Device Attestation requests for
+// the "android-key" attestation format. Its verification logic is based on
+// the documentation at https://developer.android.com/privacy-and-security/security-key-attestation
+//
+// This function performs the below steps:
+//   - Verifies that the root public certificate is trustworthy and that each certificate signs
+//     the next certificate in the chain.
+//   - Checks each certificate's revocation status to ensure that none of the certificates have
+//     been revoked.
+//   - Find the nearest certificate to the root that contains the key attestation certificate
+//     extension.
+//   - Check the extension data that you've retrieved in the previous steps for consistency and
+//     compare with the set of values that you expect the hardware-backed key to contain.
+func doAndroidKeyAttestationFormat(ctx context.Context, prov Provisioner, ch *Challenge, jwk *jose.JSONWebKey, att *attestationObject) (*androidKeyAttestationData, error) {
+	acmeProv, ok := prov.(*provisioner.ACME)
+	if !ok {
+		return nil, NewErrorISE("provisioner in context is not an ACME provisioner")
+	}
+
+	roots, ok := prov.GetAttestationRoots()
+	if !ok {
+		rsaRoot, err := pemutil.ParseCertificate([]byte(androidRSARootCA))
+		if err != nil {
+			return nil, WrapErrorISE(err, "error parsing Android RSA root CA")
+		}
+		ecdsaRoot, err := pemutil.ParseCertificate([]byte(androidECDSARootCA))
+		if err != nil {
+			return nil, WrapErrorISE(err, "error parsing Android ECDSA root CA")
+		}
+		roots = x509.NewCertPool()
+		roots.AddCert(rsaRoot)
+		roots.AddCert(ecdsaRoot)
+	}
+
+	// extract x5c and verify certificate
+	x5c, ok := att.AttStatement["x5c"].([]any)
+	if !ok {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c not present")
+	}
+	if len(x5c) == 0 {
+		return nil, NewDetailedError(ErrorRejectedIdentifierType, "x5c is empty")
+	}
+
+	// Parse leaf, intermediates and root
+	intermediates := x509.NewCertPool()
+	var leaf, root *x509.Certificate
+	for i, v := range x5c {
+		der, dok := v.([]byte)
+		if !dok {
+			return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c element is malformed")
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "failed parsing certificate at index %d", i)
+		}
+
+		// Verify certificate serial number against CRL
+		revoked, err := acmeProv.IsAndroidCertificateRevoked(ctx, cert)
+		if err != nil {
+			return nil, WrapDetailedError(ErrorServerInternalType, err, "failed checking certificate revocation status")
+		}
+		if revoked {
+			return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c element contains a revoked certificate")
+		}
+
+		switch i {
+		case 0: // leaf
+			leaf = cert
+		case len(x5c) - 1: // root
+			root = cert
+		default: // intermediates
+			intermediates.AddCert(cert)
+		}
+	}
+
+	// Require a leaf in the chain
+	if leaf == nil {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "missing leaf certificate in x5c chain")
+	}
+
+	// Require a root in the chain
+	if root == nil {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "missing root certificate in x5c chain")
+	}
+
+	// Verify the root is one of the trusted roots
+	_, err := root.Verify(x509.VerifyOptions{
+		Roots:       roots,
+		CurrentTime: time.Now().Truncate(time.Second),
+	})
+	if err != nil {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "root certificate in chain is not trusted")
+	}
+
+	// Validate the full chain including root as trust anchor
+	chains, err := leaf.Verify(x509.VerifyOptions{
+		Intermediates: intermediates,
+		Roots:         roots,
+		CurrentTime:   time.Now().Truncate(time.Second),
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	if err != nil {
+		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "x5c chain verification failed")
+	}
+
+	switch {
+	case len(chains) == 0:
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c does not contain a valid certificate chain")
+	case len(chains) > 1:
+		// currently we strictly prohibit multiple valid signing chains
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c contains multiple (%d) valid certificate chains", len(chains))
+	}
+
+	// Get signature
+	sig, ok := att.AttStatement["sig"].([]byte)
+	if !ok {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "sig not present")
+	}
+
+	keyAuth, err := KeyAuthorization(ch.Token, jwk)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find the attestation certificate
+	attCert := findAndroidAttestationCert(chains[0])
+	if attCert == nil {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "no attestation certificate with OID 1.3.6.1.4.1.11129.2.1.17 found in the cert chain")
+	}
+
+	// Verify attestation statement sig
+	if err := validateAttestationSignature(attCert, keyAuth, sig); err != nil {
+		return nil, err
+	}
+
+	data := &androidKeyAttestationData{
+		Certificate: attCert,
+	}
+	if data.Fingerprint, err = keyutil.Fingerprint(attCert.PublicKey); err != nil {
+		return nil, WrapErrorISE(err, "error calculating key fingerprint")
+	}
+
+	for _, ext := range attCert.Extensions {
+		if !ext.Id.Equal(oidAndroidAttestation) {
+			continue
+		}
+		keyDesc, err := attestation.ParseExtension(ext.Value)
+		if err != nil {
+			return nil, WrapError(ErrorBadAttestationStatementType, err, "error parsing attestation")
+		}
+		data.Attestation = keyDesc
+		break
+	}
+
+	// Validate key authorization
+	if string(data.Attestation.AttestationChallenge) != keyAuth {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "challenge mismatch; expected %q, got %q", keyAuth, string(data.Attestation.AttestationChallenge))
+	}
+
+	return data, nil
+}
+
 // Yubico PIV Root CA Serial 263751
 // https://developers.yubico.com/PIV/Introduction/piv-attestation-ca.pem
 const yubicoPIVRootCA = `-----BEGIN CERTIFICATE-----
@@ -973,9 +1656,37 @@ Fqyi4+JE014cSgR57Jcu3dZiehB6UtAPgad9L5cNvua/IWRmm+ANy3O2LH++Pyl8
 SREzU8onbBsjMg9QDiSf5oJLKvd/Ren+zGY7
 -----END CERTIFICATE-----`
 
-// Serial number of the YubiKey, encoded as an integer.
-// https://developers.yubico.com/PIV/Introduction/PIV_attestation.html
-var oidYubicoSerialNumber = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 7}
+// Yubico Attestation Root 1 (YubiKey 5.7.4+)
+// https://developers.yubico.com/PKI/yubico-ca-1.pem
+const yubicoAttestationRootCA = `-----BEGIN CERTIFICATE-----
+MIIDPjCCAiagAwIBAgIUXzeiEDJEOTt14F5n0o6Zf/bBwiUwDQYJKoZIhvcNAQEN
+BQAwJDEiMCAGA1UEAwwZWXViaWNvIEF0dGVzdGF0aW9uIFJvb3QgMTAgFw0yNDEy
+MDEwMDAwMDBaGA85OTk5MTIzMTIzNTk1OVowJDEiMCAGA1UEAwwZWXViaWNvIEF0
+dGVzdGF0aW9uIFJvb3QgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+AMZ6/TxM8rIT+EaoPvG81ontMOo/2mQ2RBwJHS0QZcxVaNXvl12LUhBZ5LmiBScI
+Zd1Rnx1od585h+/dhK7hEm7JAALkKKts1fO53KGNLZujz5h3wGncr4hyKF0G74b/
+U3K9hE5mGND6zqYchCRAHfrYMYRDF4YL0X4D5nGdxvppAy6nkEmtWmMnwO3i0TAu
+csrbE485HvGM4r0VpgVdJpvgQjiTJCTIq+D35hwtT8QDIv+nGvpcyi5wcIfCkzyC
+imJukhYy6KoqNMKQEdpNiSOvWyDMTMt1bwCvEzpw91u+msUt4rj0efnO9s0ZOwdw
+MRDnH4xgUl5ZLwrrPkfC1/0CAwEAAaNmMGQwHQYDVR0OBBYEFNLu71oijTptXCOX
+PfKF1SbxJXuSMB8GA1UdIwQYMBaAFNLu71oijTptXCOXPfKF1SbxJXuSMBIGA1Ud
+EwEB/wQIMAYBAf8CAQMwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBDQUAA4IB
+AQC3IW/sgB9pZ8apJNjxuGoX+FkILks0wMNrdXL/coUvsrhzsvl6mePMrbGJByJ1
+XnquB5sgcRENFxdQFma3mio8Upf1owM1ZreXrJ0mADG2BplqbJnxiyYa+R11reIF
+TWeIhMNcZKsDZrFAyPuFjCWSQvJmNWe9mFRYFgNhXJKkXIb5H1XgEDlwiedYRM7V
+olBNlld6pRFKlX8ust6OTMOeADl2xNF0m1LThSdeuXvDyC1g9+ILfz3S6OIYgc3i
+roRcFD354g7rKfu67qFAw9gC4yi0xBTPrY95rh4/HqaUYCA/L8ldRk6H7Xk35D+W
+Vpmq2Sh/xT5HiFuhf4wJb0bK
+-----END CERTIFICATE-----`
+
+var (
+	// serial number of the YubiKey, encoded as an integer.
+	// https://developers.yubico.com/PIV/Introduction/PIV_attestation.html
+	oidYubicoSerialNumber = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 41482, 3, 7}
+
+	// custom Smallstep managed device extension carrying a device ID or serial number
+	oidStepManagedDevice = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 4}
+)
 
 type stepAttestationData struct {
 	Certificate  *x509.Certificate
@@ -987,16 +1698,21 @@ func doStepAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge,
 	// Use configured or default attestation roots if none is configured.
 	roots, ok := prov.GetAttestationRoots()
 	if !ok {
-		root, err := pemutil.ParseCertificate([]byte(yubicoPIVRootCA))
+		pivRoot, err := pemutil.ParseCertificate([]byte(yubicoPIVRootCA))
+		if err != nil {
+			return nil, WrapErrorISE(err, "error parsing root ca")
+		}
+		attRoot, err := pemutil.ParseCertificate([]byte(yubicoAttestationRootCA))
 		if err != nil {
 			return nil, WrapErrorISE(err, "error parsing root ca")
 		}
 		roots = x509.NewCertPool()
-		roots.AddCert(root)
+		roots.AddCert(pivRoot)
+		roots.AddCert(attRoot)
 	}
 
 	// Extract x5c and verify certificate
-	x5c, ok := att.AttStatement["x5c"].([]interface{})
+	x5c, ok := att.AttStatement["x5c"].([]any)
 	if !ok {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c not present")
 	}
@@ -1044,31 +1760,15 @@ func doStepAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge,
 	if err := cbor.Unmarshal(csig, &sig); err != nil {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "sig is malformed")
 	}
+
 	keyAuth, err := KeyAuthorization(ch.Token, jwk)
 	if err != nil {
 		return nil, err
 	}
 
-	switch pub := leaf.PublicKey.(type) {
-	case *ecdsa.PublicKey:
-		if pub.Curve != elliptic.P256() {
-			return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "unsupported elliptic curve %s", pub.Curve)
-		}
-		sum := sha256.Sum256([]byte(keyAuth))
-		if !ecdsa.VerifyASN1(pub, sum[:], sig) {
-			return nil, NewDetailedError(ErrorBadAttestationStatementType, "failed to validate signature")
-		}
-	case *rsa.PublicKey:
-		sum := sha256.Sum256([]byte(keyAuth))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig); err != nil {
-			return nil, NewDetailedError(ErrorBadAttestationStatementType, "failed to validate signature")
-		}
-	case ed25519.PublicKey:
-		if !ed25519.Verify(pub, []byte(keyAuth), sig) {
-			return nil, NewDetailedError(ErrorBadAttestationStatementType, "failed to validate signature")
-		}
-	default:
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "unsupported public key type %T", pub)
+	// Verify attestation statement sig
+	if err := validateAttestationSignature(leaf, keyAuth, sig); err != nil {
+		return nil, err
 	}
 
 	// Parse attestation data:
@@ -1076,23 +1776,77 @@ func doStepAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge,
 	data := &stepAttestationData{
 		Certificate: leaf,
 	}
+
 	if data.Fingerprint, err = keyutil.Fingerprint(leaf.PublicKey); err != nil {
 		return nil, WrapErrorISE(err, "error calculating key fingerprint")
 	}
-	for _, ext := range leaf.Extensions {
-		if !ext.Id.Equal(oidYubicoSerialNumber) {
-			continue
-		}
-		var serialNumber int
-		rest, err := asn1.Unmarshal(ext.Value, &serialNumber)
-		if err != nil || len(rest) > 0 {
-			return nil, WrapError(ErrorBadAttestationStatementType, err, "error parsing serial number")
-		}
-		data.SerialNumber = strconv.Itoa(serialNumber)
-		break
+
+	if data.SerialNumber, err = searchSerialNumber(leaf); err != nil {
+		return nil, WrapErrorISE(err, "error finding serial number")
 	}
 
 	return data, nil
+}
+
+// validateAttestationSignature verifies that sig is a signature of the key
+// authorization made with the private key of the given attestation certificate.
+func validateAttestationSignature(cert *x509.Certificate, keyAuth string, sig []byte) error {
+	switch pub := cert.PublicKey.(type) {
+	case *ecdsa.PublicKey:
+		if pub.Curve != elliptic.P256() {
+			return NewDetailedError(ErrorBadAttestationStatementType, "unsupported elliptic curve %s", pub.Curve)
+		}
+		sum := sha256.Sum256([]byte(keyAuth))
+		if !ecdsa.VerifyASN1(pub, sum[:], sig) {
+			return NewDetailedError(ErrorBadAttestationStatementType, "failed validating signature")
+		}
+	case *rsa.PublicKey:
+		sum := sha256.Sum256([]byte(keyAuth))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig); err != nil {
+			return NewDetailedError(ErrorBadAttestationStatementType, "failed validating signature")
+		}
+	case ed25519.PublicKey:
+		if !ed25519.Verify(pub, []byte(keyAuth), sig) {
+			return NewDetailedError(ErrorBadAttestationStatementType, "failed validating signature")
+		}
+	case *mldsa.PublicKey:
+		if err := mldsa.Verify(pub, []byte(keyAuth), sig, nil); err != nil {
+			return NewDetailedError(ErrorBadAttestationStatementType, "failed validating signature")
+		}
+	default:
+		return NewDetailedError(ErrorBadAttestationStatementType, "unsupported public key type %T", pub)
+	}
+
+	return nil
+}
+
+// searchSerialNumber searches the certificate extensions, looking for a serial
+// number encoded in one of them. It is not guaranteed that a certificate contains
+// an extension carrying a serial number, so the result can be empty.
+func searchSerialNumber(cert *x509.Certificate) (string, error) {
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(oidYubicoSerialNumber) {
+			var serialNumber int
+			rest, err := asn1.Unmarshal(ext.Value, &serialNumber)
+			if err != nil || len(rest) > 0 {
+				return "", WrapError(ErrorBadAttestationStatementType, err, "error parsing serial number")
+			}
+			return strconv.Itoa(serialNumber), nil
+		}
+		if ext.Id.Equal(oidStepManagedDevice) {
+			type stepManagedDevice struct {
+				DeviceID string
+			}
+			var md stepManagedDevice
+			rest, err := asn1.Unmarshal(ext.Value, &md)
+			if err != nil || len(rest) > 0 {
+				return "", WrapError(ErrorBadAttestationStatementType, err, "error parsing serial number")
+			}
+			return md.DeviceID, nil
+		}
+	}
+
+	return "", nil
 }
 
 // serverName determines the SNI HostName to set based on an acme.Challenge
@@ -1117,8 +1871,7 @@ func reverseAddr(ip net.IP) (arpa string) {
 	// Must be IPv6
 	buf := make([]byte, 0, len(ip)*4+len("ip6.arpa."))
 	// Add it, in reverse, to the buffer
-	for i := len(ip) - 1; i >= 0; i-- {
-		v := ip[i]
+	for _, v := range slices.Backward(ip) {
 		buf = append(buf, hexit[v&0xF],
 			'.',
 			hexit[v>>4],
@@ -1139,7 +1892,7 @@ func uitoa(val uint) string {
 	i := len(buf) - 1
 	for val >= 10 {
 		v := val / 10
-		buf[i] = byte('0' + val - v*10)
+		buf[i] = byte('0' + val - v*10) //nolint:gosec // val - v*10 is always 0-9
 		i--
 		val = v
 	}

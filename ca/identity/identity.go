@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/api"
-	"go.step.sm/cli-utils/step"
+
+	"github.com/smallstep/cli-utils/step"
 	"go.step.sm/crypto/pemutil"
+
+	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/internal/httptransport"
 )
 
 // Type represents the different types of identity files.
@@ -270,7 +273,7 @@ func (i *Identity) GetCertPool() (*x509.CertPool, error) {
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b) {
-		return nil, errors.Errorf("error pasing identity root: %s does not contain any certificate", i.Root)
+		return nil, errors.Errorf("error parsing identity root: %s does not contain any certificate", i.Root)
 	}
 	return pool, nil
 }
@@ -293,12 +296,11 @@ func (i *Identity) Renew(client Renewer) error {
 			return err
 		}
 
-		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr := httptransport.New()
 		tr.TLSClientConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			RootCAs:                  client.GetRootCAs(),
-			MinVersion:               tls.VersionTLS12,
-			PreferServerCipherSuites: true,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      client.GetRootCAs(),
+			MinVersion:   tls.VersionTLS12,
 		}
 
 		sign, err := client.Renew(tr)
@@ -306,7 +308,7 @@ func (i *Identity) Renew(client Renewer) error {
 			return err
 		}
 
-		if sign.CertChainPEM == nil || len(sign.CertChainPEM) == 0 {
+		if len(sign.CertChainPEM) == 0 {
 			sign.CertChainPEM = []api.Certificate{sign.ServerPEM, sign.CaPEM}
 		}
 

@@ -9,10 +9,13 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority/provisioner"
+	"golang.org/x/crypto/ssh"
+
 	"github.com/smallstep/nosql"
 	"github.com/smallstep/nosql/database"
-	"golang.org/x/crypto/ssh"
+
+	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/internal/cast"
 )
 
 var (
@@ -465,7 +468,7 @@ func (db *DB) GetSSHHostPrincipals() ([]string, error) {
 		if err := json.Unmarshal(e.Value, &data); err != nil {
 			return nil, err
 		}
-		if time.Unix(int64(data.Expiry), 0).After(time.Now()) {
+		if time.Unix(cast.Int64(data.Expiry), 0).After(time.Now()) {
 			principals = append(principals, string(e.Key))
 		}
 	}
@@ -486,7 +489,7 @@ func (db *DB) Shutdown() error {
 // MockAuthDB mocks the AuthDB interface. //
 type MockAuthDB struct {
 	Err                     error
-	Ret1                    interface{}
+	Ret1                    any
 	MIsRevoked              func(string) (bool, error)
 	MIsSSHRevoked           func(string) (bool, error)
 	MRevoke                 func(rci *RevokedCertificateInfo) error
@@ -630,7 +633,7 @@ func (m *MockAuthDB) Shutdown() error {
 // MockNoSQLDB //
 type MockNoSQLDB struct {
 	Err          error
-	Ret1, Ret2   interface{}
+	Ret1, Ret2   any
 	MGet         func(bucket, key []byte) ([]byte, error)
 	MSet         func(bucket, key, value []byte) error
 	MOpen        func(dataSourceName string, opt ...database.Option) error

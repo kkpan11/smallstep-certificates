@@ -8,10 +8,12 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority/provisioner"
-	"go.step.sm/cli-utils/step"
-	"go.step.sm/linkedca"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/smallstep/cli-utils/step"
+	"github.com/smallstep/linkedca"
+
+	"github.com/smallstep/certificates/authority/provisioner"
 )
 
 // Export creates a linkedca configuration form the current ca.json and loaded
@@ -228,7 +230,7 @@ func mustDuration(d *provisioner.Duration) string {
 	return d.String()
 }
 
-func mustMarshalToStruct(v interface{}) *structpb.Struct {
+func mustMarshalToStruct(v any) *structpb.Struct {
 	b, err := json.Marshal(v)
 	if err != nil {
 		panic(errors.Wrapf(err, "error marshaling %T", v))

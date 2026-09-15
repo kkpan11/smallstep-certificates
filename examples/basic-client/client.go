@@ -1,3 +1,4 @@
+//nolint:govet // example code; allow unused variables
 package main
 
 import (
@@ -12,7 +13,7 @@ import (
 	"github.com/smallstep/certificates/ca"
 )
 
-func printResponse(name string, v interface{}) {
+func printResponse(name string, v any) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		panic(err)
@@ -95,10 +96,11 @@ func main() {
 	// An http server will use the tls.Config like:
 	_ = &http.Server{
 		Addr: ":443",
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Write([]byte("Hello world"))
 		}),
-		TLSConfig: tlsConfig,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	// Get tls.Config for a client
@@ -115,8 +117,7 @@ func main() {
 			// Options set in http.DefaultTransport
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				DualStack: true,
+				Timeout: 30 * time.Second,
 			}).DialContext,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,

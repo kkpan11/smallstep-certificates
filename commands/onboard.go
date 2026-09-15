@@ -9,16 +9,18 @@ import (
 	"os"
 
 	"github.com/pkg/errors"
+	"github.com/urfave/cli"
+
+	"github.com/smallstep/cli-utils/command"
+	"github.com/smallstep/cli-utils/errs"
+	"github.com/smallstep/cli-utils/fileutil"
+	"github.com/smallstep/cli-utils/ui"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/pki"
-	"github.com/urfave/cli"
-	"go.step.sm/cli-utils/command"
-	"go.step.sm/cli-utils/errs"
-	"go.step.sm/cli-utils/fileutil"
-	"go.step.sm/cli-utils/ui"
-	"go.step.sm/crypto/randutil"
 )
 
 // defaultOnboardingURL is the production onboarding url, to use a development
@@ -211,7 +213,7 @@ func onboardPKI(cfg onboardingConfiguration) (*config.Config, string, error) {
 		return nil, "", err
 	}
 
-	b, err := json.MarshalIndent(caConfig, "", "   ")
+	b, err := json.MarshalIndent(caConfig, "", "   ") //nolint:gosec // config struct contains password field by design
 	if err != nil {
 		return nil, "", errors.Wrapf(err, "error marshaling %s", p.GetCAConfigPath())
 	}
@@ -222,7 +224,7 @@ func onboardPKI(cfg onboardingConfiguration) (*config.Config, string, error) {
 	return caConfig, p.GetRootFingerprint(), nil
 }
 
-func readJSON(r io.ReadCloser, v interface{}) error {
+func readJSON(r io.ReadCloser, v any) error {
 	defer r.Close()
 	return json.NewDecoder(r).Decode(v)
 }

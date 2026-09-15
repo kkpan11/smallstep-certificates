@@ -18,10 +18,10 @@ ci: testcgo build
 #########################################
 
 bootstra%:
-	$Q curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin latest
+	$Q curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $$(go env GOPATH)/bin latest
 	$Q go install golang.org/x/vuln/cmd/govulncheck@latest
 	$Q go install gotest.tools/gotestsum@latest
-	$Q go install github.com/goreleaser/goreleaser@latest
+	$Q go install github.com/goreleaser/goreleaser/v2@latest
 	$Q go install github.com/sigstore/cosign/v2/cmd/cosign@latest
 
 .PHONY: bootstra%

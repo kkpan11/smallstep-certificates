@@ -211,8 +211,7 @@ func decodeMessage(message string, r *http.Request) ([]byte, error) {
 
 	// only interested in corrupt input errors below this. This type of error is the
 	// most likely to return, but better safe than sorry.
-	var cie base64.CorruptInputError
-	if !errors.As(err, &cie) {
+	if _, ok := errors.AsType[base64.CorruptInputError](err); !ok {
 		return nil, fmt.Errorf("failed base64 decoding message: %w", err)
 	}
 
@@ -349,7 +348,7 @@ func PKIOperation(ctx context.Context, req request) (Response, error) {
 	microMsg, err := smallscep.ParsePKIMessage(req.Message)
 	if err != nil {
 		// return the error, because we can't use the msg for creating a CertRep
-		return Response{}, err
+		return Response{}, fmt.Errorf("failed parsing SCEP request: %w", err)
 	}
 
 	// this is essentially doing the same as smallscep.ParsePKIMessage, but
@@ -384,14 +383,20 @@ func PKIOperation(ctx context.Context, req request) (Response, error) {
 	// even if using the renewal flow as described in the README.md. MicroMDM SCEP client also only does PKCSreq by default, unless
 	// a certificate exists; then it will use RenewalReq. Adding the challenge check here may be a small breaking change for clients.
 	// We'll have to see how it works out.
+	var signCSROpts []provisioner.SignCSROption
 	if msg.MessageType == smallscep.PKCSReq || msg.MessageType == smallscep.RenewalReq {
-		if err := auth.ValidateChallenge(ctx, csr, challengePassword, transactionID); err != nil {
+		challengeOptions, err := auth.ValidateChallenge(ctx, csr, challengePassword, transactionID)
+		if err != nil {
 			if errors.Is(err, provisioner.ErrSCEPChallengeInvalid) {
 				return createFailureResponse(ctx, csr, msg, smallscep.BadRequest, err.Error(), err)
 			}
 			scepErr := errors.New("failed validating challenge password")
 			return createFailureResponse(ctx, csr, msg, smallscep.BadRequest, scepErr.Error(), scepErr)
 		}
+		signCSROpts = append(signCSROpts, challengeOptions...)
+	} else {
+		scepErr := fmt.Errorf("unexpected message type: (%s)", string(msg.MessageType))
+		return createFailureResponse(ctx, csr, msg, smallscep.BadRequest, scepErr.Error(), scepErr)
 	}
 
 	// TODO: authorize renewal: we can authorize renewals with the challenge password (if reusable secrets are used).
@@ -402,7 +407,7 @@ func PKIOperation(ctx context.Context, req request) (Response, error) {
 	// Authentication by the (self-signed) certificate with an optional challenge is required; supporting renewals incl. verification
 	// of the client cert is not.
 
-	certRep, err := auth.SignCSR(ctx, csr, msg)
+	certRep, err := auth.SignCSR(ctx, csr, msg, signCSROpts...)
 	if err != nil {
 		if notifyErr := auth.NotifyFailure(ctx, csr, transactionID, 0, err.Error()); notifyErr != nil {
 			// TODO(hs): ignore this error case? It's not critical if the notification fails; but logging it might be good

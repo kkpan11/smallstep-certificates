@@ -3,6 +3,8 @@ package provisioner
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -12,14 +14,18 @@ import (
 )
 
 func Test_newKeyStore(t *testing.T) {
-	srv := generateJWKServer(2)
+	srv := generateTLSJWKServer(2)
+	srv.Close()
+
+	srv = httptest.NewTLSServer(srv.Config.Handler)
 	defer srv.Close()
-	ks, err := newKeyStore(srv.URL)
+
+	ks, err := newKeyStore(srv.Client(), srv.URL)
 	assert.FatalError(t, err)
-	defer ks.Close()
 
 	type args struct {
-		uri string
+		client *http.Client
+		uri    string
 	}
 	tests := []struct {
 		name    string
@@ -27,12 +33,13 @@ func Test_newKeyStore(t *testing.T) {
 		want    jose.JSONWebKeySet
 		wantErr bool
 	}{
-		{"ok", args{srv.URL}, ks.keySet, false},
-		{"fail", args{srv.URL + "/error"}, jose.JSONWebKeySet{}, true},
+		{"ok", args{srv.Client(), srv.URL}, ks.keySet, false},
+		{"fail", args{srv.Client(), srv.URL + "/error"}, jose.JSONWebKeySet{}, true},
+		{"fail client", args{http.DefaultClient, srv.URL}, jose.JSONWebKeySet{}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := newKeyStore(tt.args.uri)
+			got, err := newKeyStore(tt.args.client, tt.args.uri)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("newKeyStore() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -41,7 +48,6 @@ func Test_newKeyStore(t *testing.T) {
 				if !reflect.DeepEqual(got.keySet, tt.want) {
 					t.Errorf("newKeyStore() = %v, want %v", got, tt.want)
 				}
-				got.Close()
 			}
 		})
 	}
@@ -51,9 +57,8 @@ func Test_keyStore(t *testing.T) {
 	srv := generateJWKServer(2)
 	defer srv.Close()
 
-	ks, err := newKeyStore(srv.URL + "/random")
+	ks, err := newKeyStore(srv.Client(), srv.URL+"/random")
 	assert.FatalError(t, err)
-	defer ks.Close()
 	ks.RLock()
 	keySet1 := ks.keySet
 	ks.RUnlock()
@@ -65,6 +70,7 @@ func Test_keyStore(t *testing.T) {
 
 	// Wait for rotation
 	time.Sleep(5 * time.Second)
+	assert.Len(t, 0, ks.Get("foobar")) // force refresh
 
 	ks.RLock()
 	keySet2 := ks.keySet
@@ -95,9 +101,8 @@ func Test_keyStore_noCache(t *testing.T) {
 	srv := generateJWKServer(2)
 	defer srv.Close()
 
-	ks, err := newKeyStore(srv.URL + "/no-cache")
+	ks, err := newKeyStore(srv.Client(), srv.URL+"/no-cache")
 	assert.FatalError(t, err)
-	defer ks.Close()
 	ks.RLock()
 	keySet1 := ks.keySet
 	ks.RUnlock()
@@ -106,20 +111,6 @@ func Test_keyStore_noCache(t *testing.T) {
 	assert.Len(t, 2, keySet1.Keys)
 	assert.Len(t, 0, ks.Get(keySet1.Keys[0].KeyID))
 	assert.Len(t, 0, ks.Get(keySet1.Keys[1].KeyID))
-	assert.Len(t, 0, ks.Get("foobar"))
-
-	ks.RLock()
-	keySet2 := ks.keySet
-	ks.RUnlock()
-	if reflect.DeepEqual(keySet1, keySet2) {
-		t.Error("keyStore did not rotated")
-	}
-
-	// The keys will rotate on Get.
-	// So we won't be able to find the cached ones
-	assert.Len(t, 2, keySet2.Keys)
-	assert.Len(t, 0, ks.Get(keySet2.Keys[0].KeyID))
-	assert.Len(t, 0, ks.Get(keySet2.Keys[1].KeyID))
 	assert.Len(t, 0, ks.Get("foobar"))
 
 	// Check hits
@@ -137,9 +128,8 @@ func Test_keyStore_noCache(t *testing.T) {
 func Test_keyStore_Get(t *testing.T) {
 	srv := generateJWKServer(2)
 	defer srv.Close()
-	ks, err := newKeyStore(srv.URL)
+	ks, err := newKeyStore(srv.Client(), srv.URL)
 	assert.FatalError(t, err)
-	defer ks.Close()
 
 	type args struct {
 		kid string

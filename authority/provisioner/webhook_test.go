@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -17,15 +18,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	"go.step.sm/crypto/pemutil"
-	"go.step.sm/crypto/x509util"
-	"go.step.sm/linkedca"
-
+	"github.com/smallstep/certificates/internal/httptransport"
 	"github.com/smallstep/certificates/middleware/requestid"
 	"github.com/smallstep/certificates/webhook"
+	"github.com/smallstep/linkedca"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/x509util"
 )
 
 func TestWebhookController_isCertTypeOK(t *testing.T) {
@@ -122,6 +122,7 @@ func TestWebhookController_Enrich(t *testing.T) {
 		expectErr          bool
 		expectTemplateData any
 		assertRequest      func(t *testing.T, req *webhook.RequestBody)
+		assertError        func(t *testing.T, err error)
 	}
 	tests := map[string]test{
 		"ok/no enriching webhooks": {
@@ -228,6 +229,28 @@ func TestWebhookController_Enrich(t *testing.T) {
 			responses:          []*webhook.ResponseBody{{Allow: false}},
 			expectErr:          true,
 			expectTemplateData: x509util.TemplateData{},
+			assertError: func(t *testing.T, err error) {
+				assert.Equal(t, ErrWebhookDenied, err)
+			},
+		},
+		"deny/with error": {
+			ctl: &WebhookController{
+				client:       http.DefaultClient,
+				webhooks:     []*Webhook{{Name: "people", Kind: "ENRICHING"}},
+				TemplateData: x509util.TemplateData{},
+			},
+			ctx: withRequestID(t, context.Background(), "reqID"),
+			req: &webhook.RequestBody{},
+			responses: []*webhook.ResponseBody{{Allow: false, Error: &webhook.Error{
+				Code: "theCode", Message: "Some message",
+			}}},
+			expectErr:          true,
+			expectTemplateData: x509util.TemplateData{},
+			assertError: func(t *testing.T, err error) {
+				assert.Equal(t, &webhook.Error{
+					Code: "theCode", Message: "Some message",
+				}, err)
+			},
 		},
 		"fail/with options": {
 			ctl: &WebhookController{
@@ -268,6 +291,9 @@ func TestWebhookController_Enrich(t *testing.T) {
 			if test.assertRequest != nil {
 				test.assertRequest(t, test.req)
 			}
+			if test.assertError != nil {
+				test.assertError(t, err)
+			}
 		})
 	}
 }
@@ -283,6 +309,7 @@ func TestWebhookController_Authorize(t *testing.T) {
 		responses     []*webhook.ResponseBody
 		expectErr     bool
 		assertRequest func(t *testing.T, req *webhook.RequestBody)
+		assertError   func(t *testing.T, err error)
 	}
 	tests := map[string]test{
 		"ok/no enriching webhooks": {
@@ -346,6 +373,26 @@ func TestWebhookController_Authorize(t *testing.T) {
 			req:       &webhook.RequestBody{},
 			responses: []*webhook.ResponseBody{{Allow: false}},
 			expectErr: true,
+			assertError: func(t *testing.T, err error) {
+				assert.Equal(t, ErrWebhookDenied, err)
+			},
+		},
+		"deny/withError": {
+			ctl: &WebhookController{
+				client:   http.DefaultClient,
+				webhooks: []*Webhook{{Name: "people", Kind: "AUTHORIZING"}},
+			},
+			ctx: withRequestID(t, context.Background(), "reqID"),
+			req: &webhook.RequestBody{},
+			responses: []*webhook.ResponseBody{{Allow: false, Error: &webhook.Error{
+				Code: "theCode", Message: "Some message",
+			}}},
+			expectErr: true,
+			assertError: func(t *testing.T, err error) {
+				assert.Equal(t, &webhook.Error{
+					Code: "theCode", Message: "Some message",
+				}, err)
+			},
 		},
 		"fail/with options": {
 			ctl: &WebhookController{
@@ -383,6 +430,9 @@ func TestWebhookController_Authorize(t *testing.T) {
 			if test.assertRequest != nil {
 				test.assertRequest(t, test.req)
 			}
+			if test.assertError != nil {
+				test.assertError(t, err)
+			}
 		})
 	}
 }
@@ -408,7 +458,7 @@ func TestWebhook_Do(t *testing.T) {
 			},
 			requestID: "reqID",
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 		},
 		"ok/no-request-id": {
@@ -417,7 +467,7 @@ func TestWebhook_Do(t *testing.T) {
 				Secret: "c2VjcmV0Cg==",
 			},
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 		},
 		"ok/bearer": {
@@ -428,7 +478,7 @@ func TestWebhook_Do(t *testing.T) {
 			},
 			requestID: "reqID",
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 		},
 		"ok/basic": {
@@ -445,7 +495,7 @@ func TestWebhook_Do(t *testing.T) {
 			},
 			requestID: "reqID",
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 		},
 		"ok/templated-url": {
@@ -456,9 +506,9 @@ func TestWebhook_Do(t *testing.T) {
 				Secret: "c2VjcmV0Cg==",
 			},
 			requestID: "reqID",
-			dataArg:   map[string]interface{}{"username": "areed", "region": "central"},
+			dataArg:   map[string]any{"username": "areed", "region": "central"},
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 			expectPath: "/users/areed?region=central",
 		},
@@ -502,7 +552,7 @@ func TestWebhook_Do(t *testing.T) {
 				Secret: "c2VjcmV0Cg==",
 			},
 			webhookResponse: webhook.ResponseBody{
-				Data: map[string]interface{}{"role": "dba"},
+				Data: map[string]any{"role": "dba"},
 			},
 			requestID:     "reqID",
 			errStatusCode: 404,
@@ -516,6 +566,8 @@ func TestWebhook_Do(t *testing.T) {
 				if tc.requestID != "" {
 					assert.Equal(t, tc.requestID, r.Header.Get("X-Request-ID"))
 				}
+
+				assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 
 				assert.Equal(t, tc.webhook.ID, r.Header.Get("X-Smallstep-Webhook-ID"))
 
@@ -576,7 +628,7 @@ func TestWebhook_Do(t *testing.T) {
 			ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 			defer cancel()
 
-			got, err := tc.webhook.DoWithContext(ctx, http.DefaultClient, reqBody, tc.dataArg)
+			got, err := tc.webhook.DoWithContext(ctx, http.DefaultClient, httptransport.NoopWrapper(), reqBody, tc.dataArg)
 			if tc.expectErr != nil {
 				assert.Equal(t, tc.expectErr.Error(), err.Error())
 				return
@@ -597,7 +649,8 @@ func TestWebhook_Do(t *testing.T) {
 		}
 		cert, err := tls.LoadX509KeyPair("testdata/certs/foo.crt", "testdata/secrets/foo.key")
 		require.NoError(t, err)
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+
+		transport := httptransport.New()
 		transport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 			Certificates:       []tls.Certificate{cert},
@@ -611,14 +664,38 @@ func TestWebhook_Do(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 		defer cancel()
 
-		_, err = wh.DoWithContext(ctx, client, reqBody, nil)
+		_, err = wh.DoWithContext(ctx, client, httptransport.NoopWrapper(), reqBody, nil)
 		require.NoError(t, err)
 
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*10)
 		defer cancel()
 
 		wh.DisableTLSClientAuth = true
-		_, err = wh.DoWithContext(ctx, client, reqBody, nil)
+		_, err = wh.DoWithContext(ctx, client, httptransport.NoopWrapper(), reqBody, nil)
 		require.Error(t, err)
 	})
+}
+
+func TestWebhook_Validate(t *testing.T) {
+	tests := []struct {
+		name      string
+		webhook   *Webhook
+		assertion assert.ErrorAssertionFunc
+	}{
+		{"ok enriching", &Webhook{Name: "devices", URL: "https://localhost:3000", Kind: "ENRICHING"}, assert.NoError},
+		{"ok authorizing", &Webhook{Name: "devices", URL: "https://localhost:3000/devices", Kind: "AUTHORIZING"}, assert.NoError},
+		{"fail name", &Webhook{Name: "", URL: "https://localhost:3000", Kind: "ENRICHING"}, assert.Error},
+		{"fail url", &Webhook{Name: "devices", URL: "", Kind: "ENRICHING"}, assert.Error},
+		{"fail bad url", &Webhook{Name: "devices", URL: "https://{{.Templated.Host}}", Kind: "ENRICHING"}, assert.Error},
+		{"fail host", &Webhook{Name: "devices", URL: "https:opaque", Kind: "ENRICHING"}, assert.Error},
+		{"fail scheme", &Webhook{Name: "devices", URL: "http://localhost", Kind: "ENRICHING"}, assert.Error},
+		{"fail user", &Webhook{Name: "devices", URL: "https://user:pass@localhost", Kind: "ENRICHING"}, assert.Error},
+		{"fail kind", &Webhook{Name: "devices", URL: "https://localhost:3000", Kind: ""}, assert.Error},
+		{"fail bad kind", &Webhook{Name: "devices", URL: "https://localhost:3000", Kind: "SOMETHING"}, assert.Error},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.assertion(t, tt.webhook.Validate())
+		})
+	}
 }

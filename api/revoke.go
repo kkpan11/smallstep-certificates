@@ -94,8 +94,9 @@ func Revoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		opts.Crt = r.TLS.PeerCertificates[0]
-		if opts.Crt.SerialNumber.String() != opts.Serial {
-			render.Error(w, r, errs.BadRequest("serial number in client certificate different than body"))
+		if serialNumber := opts.Crt.SerialNumber.String(); opts.Serial != serialNumber {
+			render.Error(w, r, errs.Forbidden(
+				"request serial number %q and certificate serial number %q do not match", opts.Serial, serialNumber))
 			return
 		}
 		// TODO: should probably be checking if the certificate was revoked here.
@@ -116,7 +117,7 @@ func Revoke(w http.ResponseWriter, r *http.Request) {
 
 func logRevoke(w http.ResponseWriter, ri *authority.RevokeOptions) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
-		rl.WithFields(map[string]interface{}{
+		rl.WithFields(map[string]any{
 			"serial":      ri.Serial,
 			"reasonCode":  ri.ReasonCode,
 			"reason":      ri.Reason,

@@ -20,6 +20,7 @@ import (
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
+	"github.com/smallstep/certificates/internal/cast"
 	"github.com/smallstep/certificates/templates"
 )
 
@@ -44,10 +45,10 @@ type SSHSignRequest struct {
 	CertType         string             `json:"certType,omitempty"`
 	KeyID            string             `json:"keyID,omitempty"`
 	Principals       []string           `json:"principals,omitempty"`
-	ValidAfter       TimeDuration       `json:"validAfter,omitempty"`
-	ValidBefore      TimeDuration       `json:"validBefore,omitempty"`
+	ValidAfter       TimeDuration       `json:"validAfter"`
+	ValidBefore      TimeDuration       `json:"validBefore"`
 	AddUserPublicKey []byte             `json:"addUserPublicKey,omitempty"`
-	IdentityCSR      CertificateRequest `json:"identityCSR,omitempty"`
+	IdentityCSR      CertificateRequest `json:"identityCSR"`
 	TemplateData     json.RawMessage    `json:"templateData,omitempty"`
 }
 
@@ -292,6 +293,7 @@ func SSHSign(w http.ResponseWriter, r *http.Request) {
 
 	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHSignMethod)
 	ctx = provisioner.NewContextWithToken(ctx, body.OTT)
+	ctx = provisioner.NewContextWithCertType(ctx, opts.CertType)
 
 	a := mustAuthority(ctx)
 	signOpts, err := a.Authorize(ctx, body.OTT)
@@ -330,8 +332,8 @@ func SSHSign(w http.ResponseWriter, r *http.Request) {
 		// Enforce the same duration as ssh certificate.
 		signOpts = append(signOpts, &identityModifier{
 			Identity:  getIdentityURI(cr),
-			NotBefore: time.Unix(int64(cert.ValidAfter), 0),
-			NotAfter:  time.Unix(int64(cert.ValidBefore), 0),
+			NotBefore: time.Unix(cast.Int64(cert.ValidAfter), 0),
+			NotAfter:  time.Unix(cast.Int64(cert.ValidBefore), 0),
 		})
 
 		certChain, err := a.SignWithContext(ctx, cr, provisioner.SignOptions{}, signOpts...)

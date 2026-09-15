@@ -70,14 +70,13 @@ func SSHRevoke(w http.ResponseWriter, r *http.Request) {
 	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHRevokeMethod)
 	a := mustAuthority(ctx)
 
-	// A token indicates that we are using the api via a provisioner token,
-	// otherwise it is assumed that the certificate is revoking itself over mTLS.
 	logOtt(w, body.OTT)
 
 	if _, err := a.Authorize(ctx, body.OTT); err != nil {
 		render.Error(w, r, errs.UnauthorizedErr(err))
 		return
 	}
+
 	opts.OTT = body.OTT
 
 	if err := a.Revoke(ctx, opts); err != nil {
@@ -91,7 +90,7 @@ func SSHRevoke(w http.ResponseWriter, r *http.Request) {
 
 func logSSHRevoke(w http.ResponseWriter, ri *authority.RevokeOptions) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
-		rl.WithFields(map[string]interface{}{
+		rl.WithFields(map[string]any{
 			"serial":      ri.Serial,
 			"reasonCode":  ri.ReasonCode,
 			"reason":      ri.Reason,

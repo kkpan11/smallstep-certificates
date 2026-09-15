@@ -26,6 +26,7 @@ type CertificateAuthority interface {
 	IsRevoked(sn string) (bool, error)
 	Revoke(context.Context, *authority.RevokeOptions) error
 	LoadProvisionerByName(string) (provisioner.Interface, error)
+	GetBackdate() *time.Duration
 }
 
 // NewContext adds the given acme components to the context.
@@ -108,7 +109,7 @@ func MustProvisionerFromContext(ctx context.Context) Provisioner {
 
 // MockProvisioner for testing
 type MockProvisioner struct {
-	Mret1                     interface{}
+	Mret1                     any
 	Merr                      error
 	MgetID                    func() string
 	MgetName                  func() string

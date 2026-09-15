@@ -3,12 +3,8 @@ package ca
 import (
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +14,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/ca/identity"
+	"github.com/smallstep/certificates/internal/cryptoutil"
 )
 
 // mTLSDialContext will hold the dial context function to use in
@@ -62,7 +59,7 @@ func init() {
 		}
 		mTLSDialContext = func() func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := &tls.Dialer{
-				NetDialer: getDefaultDialer(),
+				NetDialer: createDefaultDialer(),
 				Config: &tls.Config{
 					MinVersion:           tls.VersionTLS12,
 					RootCAs:              pool,
@@ -110,7 +107,7 @@ func (c *Client) GetClientTLSConfig(ctx context.Context, sign *api.SignResponse,
 	return tlsConfig, nil
 }
 
-func (c *Client) getClientTLSConfig(ctx context.Context, sign *api.SignResponse, pk crypto.PrivateKey, options []TLSOption) (*tls.Config, *http.Transport, error) {
+func (c *Client) getClientTLSConfig(ctx context.Context, sign *api.SignResponse, pk crypto.PrivateKey, options []TLSOption) (*tls.Config, http.RoundTripper, error) {
 	cert, err := TLSCertificate(sign, pk)
 	if err != nil {
 		return nil, nil, err
@@ -132,17 +129,19 @@ func (c *Client) getClientTLSConfig(ctx context.Context, sign *api.SignResponse,
 	}
 
 	tr := getDefaultTransport(tlsConfig)
-	//nolint:staticcheck // Use mutable tls.Config on renew
-	tr.DialTLS = c.buildDialTLS(tlsCtx)
-	// tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
-	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk) //nolint:contextcheck // deeply nested context
+	tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
+
+	// Add decorator if available, and use the resulting [http.RoundTripper]
+	// going forward
+	rt := decorateRoundTripper(tr, c.transportDecorator)
+	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, rt, pk) //nolint:contextcheck // deeply nested context
 
 	// Update client transport
-	c.SetTransport(tr)
+	c.SetTransport(rt)
 
 	// Start renewer
 	renewer.RunContext(ctx)
-	return tlsConfig, tr, nil
+	return tlsConfig, rt, nil
 }
 
 // GetServerTLSConfig returns a tls.Config for server use configured with the
@@ -180,21 +179,24 @@ func (c *Client) GetServerTLSConfig(ctx context.Context, sign *api.SignResponse,
 
 	// Update renew function with transport
 	tr := getDefaultTransport(tlsConfig)
-	//nolint:staticcheck // Use mutable tls.Config on renew
-	tr.DialTLS = c.buildDialTLS(tlsCtx)
-	// tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
-	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk) //nolint:contextcheck // deeply nested context
+	tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
+
+	// Add decorator if available, and use the resulting [http.RoundTripper]
+	// going forward
+	rt := decorateRoundTripper(tr, c.transportDecorator)
+	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, rt, pk) //nolint:contextcheck // deeply nested context
 
 	// Update client transport
-	c.SetTransport(tr)
+	c.SetTransport(rt)
 
 	// Start renewer
 	renewer.RunContext(ctx)
 	return tlsConfig, nil
 }
 
-// Transport returns an http.Transport configured to use the client certificate from the sign response.
-func (c *Client) Transport(ctx context.Context, sign *api.SignResponse, pk crypto.PrivateKey, options ...TLSOption) (*http.Transport, error) {
+// Transport returns an [http.RoundTripper] configured to use the client
+// certificate from the sign response.
+func (c *Client) Transport(ctx context.Context, sign *api.SignResponse, pk crypto.PrivateKey, options ...TLSOption) (http.RoundTripper, error) {
 	_, tr, err := c.getClientTLSConfig(ctx, sign, pk, options)
 	if err != nil {
 		return nil, err
@@ -214,17 +216,10 @@ func (c *Client) buildGetConfigForClient(ctx *TLSOptionCtx) func(*tls.ClientHell
 	}
 }
 
-// buildDialTLS returns an implementation of DialTLS callback in http.Transport.
-func (c *Client) buildDialTLS(ctx *TLSOptionCtx) func(network, addr string) (net.Conn, error) {
-	return func(network, addr string) (net.Conn, error) {
-		return tls.DialWithDialer(getDefaultDialer(), network, addr, ctx.mutableConfig.TLSConfig())
-	}
-}
-
-//nolint:unused // buildDialTLSContext returns an implementation of DialTLSContext callback in http.Transport.
+// buildDialTLSContext returns an implementation of DialTLSContext callback in http.Transport.
 func (c *Client) buildDialTLSContext(tlsCtx *TLSOptionCtx) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		d := getDefaultDialer()
+		d := createDefaultDialer()
 		// TLS dialers do not support context, but we can use the context
 		// deadline if it is set.
 		if t, ok := ctx.Deadline(); ok {
@@ -266,15 +261,15 @@ func RootCertificate(sign *api.SignResponse) (*x509.Certificate, error) {
 // TLSCertificate creates a new TLS certificate from the sign response and the
 // private key used.
 func TLSCertificate(sign *api.SignResponse, pk crypto.PrivateKey) (*tls.Certificate, error) {
-	certPEM, err := getPEM(sign.ServerPEM)
+	certPEM, err := cryptoutil.PEMEncode(sign.ServerPEM.Certificate)
 	if err != nil {
 		return nil, err
 	}
-	caPEM, err := getPEM(sign.CaPEM)
+	caPEM, err := cryptoutil.PEMEncode(sign.CaPEM.Certificate)
 	if err != nil {
 		return nil, err
 	}
-	keyPEM, err := getPEM(pk)
+	keyPEM, err := cryptoutil.PEMEncode(pk)
 	if err != nil {
 		return nil, err
 	}
@@ -302,8 +297,8 @@ func getDefaultTLSConfig(sign *api.SignResponse) *tls.Config {
 	}
 }
 
-// getDefaultDialer returns a new dialer with the default configuration.
-func getDefaultDialer() *net.Dialer {
+// createDefaultDialer returns a new dialer with the default configuration.
+func createDefaultDialer() *net.Dialer {
 	// With the KeepAlive parameter set to 0, it will be use Golang's default.
 	return &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -327,7 +322,7 @@ func getDefaultTransport(tlsConfig *tls.Config) *http.Transport {
 		// context if it is available, required and expected to work.
 		dialContext = nil
 	case mTLSDialContext == nil:
-		d := getDefaultDialer()
+		d := createDefaultDialer()
 		dialContext = d.DialContext
 	default:
 		dialContext = mTLSDialContext()
@@ -344,40 +339,11 @@ func getDefaultTransport(tlsConfig *tls.Config) *http.Transport {
 	}
 }
 
-func getPEM(i interface{}) ([]byte, error) {
-	block := new(pem.Block)
-	switch i := i.(type) {
-	case api.Certificate:
-		block.Type = "CERTIFICATE"
-		block.Bytes = i.Raw
-	case *x509.Certificate:
-		block.Type = "CERTIFICATE"
-		block.Bytes = i.Raw
-	case *rsa.PrivateKey:
-		block.Type = "RSA PRIVATE KEY"
-		block.Bytes = x509.MarshalPKCS1PrivateKey(i)
-	case *ecdsa.PrivateKey:
-		var err error
-		block.Type = "EC PRIVATE KEY"
-		block.Bytes, err = x509.MarshalECPrivateKey(i)
-		if err != nil {
-			return nil, errors.Wrap(err, "error marshaling private key")
-		}
-	case ed25519.PrivateKey:
-		var err error
-		block.Type = "PRIVATE KEY"
-		block.Bytes, err = x509.MarshalPKCS8PrivateKey(i)
-		if err != nil {
-			return nil, errors.Wrap(err, "error marshaling private key")
-		}
-	default:
-		return nil, errors.Errorf("unsupported key type %T", i)
-	}
-	return pem.EncodeToMemory(block), nil
-}
-
-func getRenewFunc(ctx *TLSOptionCtx, client *Client, tr *http.Transport, pk crypto.PrivateKey) RenewFunc {
+func getRenewFunc(ctx *TLSOptionCtx, client *Client, tr http.RoundTripper, pk crypto.PrivateKey) RenewFunc {
 	return func() (*tls.Certificate, error) {
+		// Close connections in keep-alive state
+		defer client.CloseIdleConnections()
+
 		// Get updated list of roots
 		if err := ctx.applyRenew(); err != nil {
 			return nil, err

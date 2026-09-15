@@ -189,7 +189,7 @@ func TestTemplateOptions(t *testing.T) {
 
 func TestCustomTemplateOptions(t *testing.T) {
 	csr := parseCertificateRequest(t, "testdata/certs/ecdsa.csr")
-	csrCertificate := `{"version":0,"subject":{"commonName":"foo"},"rawSubject":"MA4xDDAKBgNVBAMTA2Zvbw==","dnsNames":["foo"],"emailAddresses":null,"ipAddresses":null,"uris":null,"sans":null,"extensions":[{"id":"2.5.29.17","critical":false,"value":"MAWCA2Zvbw=="}],"signatureAlgorithm":""}`
+	csrCertificate := `{"version":0,"subject":{"commonName":"foo"},"rawSubject":"MA4xDDAKBgNVBAMTA2Zvbw==","dnsNames":["foo"],"emailAddresses":null,"ipAddresses":null,"uris":null,"sans":null,"extensions":[{"id":"2.5.29.17","critical":false,"value":"MAWCA2Zvbw=="}],"keyUsage":null,"extKeyUsage":[],"unknownExtKeyUsage":null,"basicConstraints":null,"signatureAlgorithm":""}`
 	data := x509util.TemplateData{
 		x509util.SubjectKey: x509util.Subject{
 			CommonName: "foobar",
@@ -292,10 +292,10 @@ func Test_unsafeParseSigned(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    args
-		want    map[string]interface{}
+		want    map[string]any
 		wantErr bool
 	}{
-		{"ok", args{okToken}, map[string]interface{}{
+		{"ok", args{okToken}, map[string]any{
 			"sub": "jane@doe.com",
 			"iss": "https://doe.com",
 			"jti": "8ff32481-fd5f-4e2e-96df-908c127c85f7",

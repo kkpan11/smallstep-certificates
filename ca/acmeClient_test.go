@@ -12,18 +12,20 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
 	"github.com/smallstep/assert"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+
 	"github.com/smallstep/certificates/acme"
 	acmeAPI "github.com/smallstep/certificates/acme/api"
 	"github.com/smallstep/certificates/api/render"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/pemutil"
 )
 
 func TestNewACMEClient(t *testing.T) {
 	type test struct {
 		ops      []ClientOption
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -110,11 +112,11 @@ func TestNewACMEClient(t *testing.T) {
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equals(t, "step-http-client/1.0", r.Header.Get("User-Agent")) // check default User-Agent header
-				switch {
-				case i == 0:
+				switch i {
+				case 0:
 					render.JSONStatus(w, r, tc.r1, tc.rc1)
 					i++
-				case i == 1:
+				case 1:
 					w.Header().Set("Replay-Nonce", "abc123")
 					render.JSONStatus(w, r, []byte{}, 200)
 					i++
@@ -157,7 +159,7 @@ func TestACMEClient_GetDirectory(t *testing.T) {
 
 func TestACMEClient_GetNonce(t *testing.T) {
 	type test struct {
-		r1  interface{}
+		r1  any
 		rc1 int
 		err error
 	}
@@ -169,7 +171,7 @@ func TestACMEClient_GetNonce(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -227,7 +229,7 @@ func TestACMEClient_post(t *testing.T) {
 		payload  []byte
 		Key      *jose.JSONWebKey
 		ops      []withHeaderOption
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		jwkInJWS bool
 		client   *ACMEClient
@@ -241,7 +243,7 @@ func TestACMEClient_post(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -359,7 +361,7 @@ func TestACMEClient_post(t *testing.T) {
 func TestACMEClient_NewOrder(t *testing.T) {
 	type test struct {
 		ops      []withHeaderOption
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -372,7 +374,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 		NewOrder: srv.URL + "/bar",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -495,7 +497,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 
 func TestACMEClient_GetOrder(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -507,7 +509,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -617,7 +619,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 
 func TestACMEClient_GetAuthz(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -629,7 +631,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -739,7 +741,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 
 func TestACMEClient_GetChallenge(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -751,7 +753,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -862,7 +864,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 
 func TestACMEClient_ValidateChallenge(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -874,7 +876,7 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -1075,7 +1077,7 @@ func TestACMEClient_ValidateWithPayload(t *testing.T) {
 
 func TestACMEClient_FinalizeOrder(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 	}
@@ -1087,7 +1089,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -1201,7 +1203,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 
 func TestACMEClient_GetAccountOrders(t *testing.T) {
 	type test struct {
-		r1, r2   interface{}
+		r1, r2   any
 		rc1, rc2 int
 		err      error
 		client   *ACMEClient
@@ -1214,7 +1216,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)
@@ -1334,7 +1336,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 
 func TestACMEClient_GetCertificate(t *testing.T) {
 	type test struct {
-		r1, r2    interface{}
+		r1, r2    any
 		certBytes []byte
 		rc1, rc2  int
 		err       error
@@ -1347,7 +1349,7 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
-	o := new(clientOptions)
+	o := defaultClientOptions()
 	assert.FatalError(t, o.apply([]ClientOption{WithTransport(http.DefaultTransport)}))
 	tr, err := o.getTransport(srv.URL)
 	assert.FatalError(t, err)

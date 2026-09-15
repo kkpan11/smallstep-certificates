@@ -29,6 +29,8 @@ func TestFailsIssuingCertificateUsingRegularSCEPWithUpstreamCAS(t *testing.T) {
 	require.NoError(t, err)
 
 	dir := t.TempDir()
+	t.Setenv("STEPPATH", dir)
+
 	m, err := minica.New(minica.WithName("Step E2E | SCEP Regular w/ Upstream CAS"), minica.WithGetSignerFunc(func() (crypto.Signer, error) {
 		return signer, nil
 	}))
@@ -55,7 +57,7 @@ func TestFailsIssuingCertificateUsingRegularSCEPWithUpstreamCAS(t *testing.T) {
 		Name:                          "scep",
 		Type:                          "SCEP",
 		ForceCN:                       false,
-		ChallengePassword:             "",
+		ChallengePassword:             "the-challenge",
 		EncryptionAlgorithmIdentifier: 2,
 		MinimumPublicKeyLength:        2048,
 		Claims:                        &config.GlobalProvisionerClaims,
@@ -89,13 +91,11 @@ func TestFailsIssuingCertificateUsingRegularSCEPWithUpstreamCAS(t *testing.T) {
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		err = c.Run()
 		require.ErrorIs(t, err, http.ErrServerClosed)
-	}()
+	})
 
 	// instantiate a client for the CA running at the random address
 	caClient := newCAClient(t, fmt.Sprintf("https://localhost:%s", port), rootFilepath)
@@ -104,7 +104,7 @@ func TestFailsIssuingCertificateUsingRegularSCEPWithUpstreamCAS(t *testing.T) {
 	// issuance is expected to fail when an upstream CAS is configured, as the current
 	// CAS interfaces do not support providing a decrypter.
 	scepClient := createSCEPClient(t, fmt.Sprintf("https://localhost:%s/scep/scep", port), m.Root)
-	cert, err := scepClient.requestCertificate(t, "test.localhost", []string{"test.localhost"})
+	cert, err := scepClient.requestCertificate(t)
 	assert.Error(t, err)
 	assert.Nil(t, cert)
 

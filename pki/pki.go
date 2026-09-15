@@ -17,6 +17,19 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/smallstep/cli-utils/errs"
+	"github.com/smallstep/cli-utils/fileutil"
+	"github.com/smallstep/cli-utils/step"
+	"github.com/smallstep/cli-utils/ui"
+	"github.com/smallstep/linkedca"
+	"github.com/smallstep/nosql"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/kms"
+	kmsapi "go.step.sm/crypto/kms/apiv1"
+	"go.step.sm/crypto/pemutil"
+
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/admin"
 	admindb "github.com/smallstep/certificates/authority/admin/db/nosql"
@@ -26,17 +39,6 @@ import (
 	"github.com/smallstep/certificates/cas"
 	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
-	"github.com/smallstep/nosql"
-	"go.step.sm/cli-utils/errs"
-	"go.step.sm/cli-utils/fileutil"
-	"go.step.sm/cli-utils/step"
-	"go.step.sm/cli-utils/ui"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/kms"
-	kmsapi "go.step.sm/crypto/kms/apiv1"
-	"go.step.sm/crypto/pemutil"
-	"go.step.sm/linkedca"
-	"golang.org/x/crypto/ssh"
 )
 
 // DeploymentType defines witch type of deployment a user is initializing
@@ -318,7 +320,7 @@ type PKI struct {
 // New creates a new PKI configuration.
 func New(o apiv1.Options, opts ...Option) (*PKI, error) {
 	// TODO(hs): invoking `New` with a context active will use values from
-	// that CA context while generating the context. Thay may or may not
+	// that CA context while generating the context. They may or may not
 	// be fully expected and/or what we want. This specific behavior was
 	// changed after not relying on the `init` inside of `step`, resulting in
 	// the default context being active if `step.Init` isn't called explicitly.
@@ -555,7 +557,7 @@ func (p *PKI) GenerateRootCertificate(name, org, resource string, pass []byte) (
 }
 
 // WriteRootCertificate writes to the buffer the given certificate and key if given.
-func (p *PKI) WriteRootCertificate(rootCrt *x509.Certificate, rootKey interface{}, pass []byte) error {
+func (p *PKI) WriteRootCertificate(rootCrt *x509.Certificate, rootKey any, pass []byte) error {
 	p.Files[p.Root[0]] = encodeCertificate(rootCrt)
 	if rootKey != nil {
 		var err error
@@ -747,7 +749,7 @@ func (p *PKI) askFeedback() {
 	if p.options.deploymentType == LinkedDeployment {
 		ui.Println()
 		ui.Println("\033[1mNEXT STEPS\033[0m")
-		ui.Println("  1. Log in or create a Certificate Manager account at \033[1mhttps://u.step.sm/linked\033[0m")
+		ui.Println("  1. Contact us at \033[1mhttps://u.step.sm/cm\033[0m to create a Certificate Manager account")
 		ui.Println("  2. Add a new authority and select \"Link a step-ca instance\"")
 		ui.Println("  3. Follow instructions in browser to start `step-ca` using the `--token` flag")
 		ui.Println()
@@ -984,7 +986,7 @@ func (p *PKI) Save(opt ...ConfigOption) error {
 			return err
 		}
 
-		b, err := json.MarshalIndent(cfg, "", "\t")
+		b, err := json.MarshalIndent(cfg, "", "\t") //nolint:gosec // config struct contains password field by design
 		if err != nil {
 			return errors.Wrapf(err, "error marshaling %s", p.config)
 		}

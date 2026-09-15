@@ -21,6 +21,7 @@ import (
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/api/render"
+	"github.com/smallstep/certificates/authority/provisioner/gcp"
 )
 
 func TestGCP_Getters(t *testing.T) {
@@ -187,6 +188,7 @@ func TestGCP_Init(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", fields{"GCP", "name", nil, zero, nil}, args{config, srv.URL}, false},
+		{"ok", fields{"GCP", "name", nil, zero, nil}, args{config, srv.URL}, false},
 		{"ok", fields{"GCP", "name", []string{"service-account"}, zero, nil}, args{config, srv.URL}, false},
 		{"ok", fields{"GCP", "name", []string{"service-account"}, Duration{Duration: 1 * time.Minute}, nil}, args{config, srv.URL}, false},
 		{"bad type", fields{"", "name", nil, zero, nil}, args{config, srv.URL}, true},
@@ -210,6 +212,14 @@ func TestGCP_Init(t *testing.T) {
 			}
 			if err := p.Init(tt.args.config); (err != nil) != tt.wantErr {
 				t.Errorf("GCP.Init() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if *p.DisableSSHCAUser != true {
+				t.Errorf("By default DisableSSHCAUser should be true")
+			}
+
+			if *p.DisableSSHCAHost != false {
+				t.Errorf("By default DisableSSHCAHost should be false")
 			}
 		})
 	}
@@ -283,7 +293,7 @@ func TestGCP_authorizeToken(t *testing.T) {
 		"fail/invalid-projectID": func(t *testing.T) test {
 			p, err := generateGCP()
 			assert.FatalError(t, err)
-			p.ProjectIDs = []string{"foo", "bar"}
+			p.projectValidator = &gcp.ProjectValidator{ProjectIDs: []string{"foo", "bar"}}
 			tok, err := generateGCPToken(p.ServiceAccounts[0],
 				"https://accounts.google.com", p.GetID(),
 				"instance-id", "instance-name", "project-id", "zone",
@@ -389,7 +399,7 @@ func TestGCP_authorizeToken(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
-			if claims, err := tc.p.authorizeToken(tc.token); err != nil {
+			if claims, err := tc.p.authorizeToken(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
 					var sc render.StatusCodedError
 					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
@@ -421,7 +431,7 @@ func TestGCP_AuthorizeSign(t *testing.T) {
 
 	p3, err := generateGCP()
 	assert.FatalError(t, err)
-	p3.ProjectIDs = []string{"other-project-id"}
+	p3.projectValidator = &gcp.ProjectValidator{ProjectIDs: []string{"other-project-id"}}
 	p3.ServiceAccounts = []string{"foo@developer.gserviceaccount.com"}
 	p3.InstanceAge = Duration{1 * time.Minute}
 
@@ -570,7 +580,7 @@ func TestGCP_AuthorizeSign(t *testing.T) {
 					case *urisValidator:
 						assert.Equals(t, v.uris, nil)
 						assert.Equals(t, MethodFromContext(v.ctx), SignMethod)
-					case dnsNamesValidator:
+					case dnsNamesSubsetValidator:
 						assert.Equals(t, []string(v), []string{"instance-name.c.project-id.internal", "instance-name.zone.c.project-id.internal"})
 					case *x509NamePolicyValidator:
 						assert.Equals(t, nil, v.policyEngine)
@@ -592,6 +602,9 @@ func TestGCP_AuthorizeSSHSign(t *testing.T) {
 	p1, err := generateGCP()
 	assert.FatalError(t, err)
 	p1.DisableCustomSANs = true
+	// enable ssh user CA
+	disableSSCAUser := false
+	p1.DisableSSHCAUser = &disableSSCAUser
 
 	p2, err := generateGCP()
 	assert.FatalError(t, err)
@@ -604,6 +617,12 @@ func TestGCP_AuthorizeSSHSign(t *testing.T) {
 	p3.Claims = &Claims{EnableSSHCA: &disable}
 	p3.ctl.Claimer, err = NewClaimer(p3.Claims, globalProvisionerClaims)
 	assert.FatalError(t, err)
+
+	p4, err := generateGCP()
+	assert.FatalError(t, err)
+	// disable ssh host CA
+	disableSSCAHost := true
+	p4.DisableSSHCAHost = &disableSSCAHost
 
 	t1, err := generateGCPToken(p1.ServiceAccounts[0],
 		"https://accounts.google.com", p1.GetID(),
@@ -647,11 +666,15 @@ func TestGCP_AuthorizeSSHSign(t *testing.T) {
 		CertType: "host", Principals: []string{"foo.bar", "bar.foo"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
+	expectedUserOptions := &SignSSHOptions{
+		CertType: "user", Principals: []string{FormatServiceAccountUsername(p1.ServiceAccounts[0]), "foo@developer.gserviceaccount.com"},
+		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(p1.ctl.Claimer.DefaultUserSSHCertDuration())),
+	}
 
 	type args struct {
 		token   string
 		sshOpts SignSSHOptions
-		key     interface{}
+		key     any
 	}
 	tests := []struct {
 		name        string
@@ -664,22 +687,29 @@ func TestGCP_AuthorizeSSHSign(t *testing.T) {
 	}{
 		{"ok", p1, args{t1, SignSSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
 		{"ok-rsa2048", p1, args{t1, SignSSHOptions{}, rsa2048.Public()}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-type", p1, args{t1, SignSSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-type-host", p1, args{t1, SignSSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-type-user", p1, args{t1, SignSSHOptions{CertType: "user"}, pub}, expectedUserOptions, http.StatusOK, false, false},
 		{"ok-principals", p1, args{t1, SignSSHOptions{Principals: []string{"instance-name.c.project-id.internal", "instance-name.zone.c.project-id.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
 		{"ok-principal1", p1, args{t1, SignSSHOptions{Principals: []string{"instance-name.c.project-id.internal"}}, pub}, expectedHostOptionsPrincipal1, http.StatusOK, false, false},
 		{"ok-principal2", p1, args{t1, SignSSHOptions{Principals: []string{"instance-name.zone.c.project-id.internal"}}, pub}, expectedHostOptionsPrincipal2, http.StatusOK, false, false},
 		{"ok-options", p1, args{t1, SignSSHOptions{CertType: "host", Principals: []string{"instance-name.c.project-id.internal", "instance-name.zone.c.project-id.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
 		{"ok-custom", p2, args{t2, SignSSHOptions{Principals: []string{"foo.bar", "bar.foo"}}, pub}, expectedCustomOptions, http.StatusOK, false, false},
 		{"fail-rsa1024", p1, args{t1, SignSSHOptions{}, rsa1024.Public()}, expectedHostOptions, http.StatusOK, false, true},
-		{"fail-type", p1, args{t1, SignSSHOptions{CertType: "user"}, pub}, nil, http.StatusOK, false, true},
 		{"fail-principal", p1, args{t1, SignSSHOptions{Principals: []string{"smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
 		{"fail-extra-principal", p1, args{t1, SignSSHOptions{Principals: []string{"instance-name.c.project-id.internal", "instance-name.zone.c.project-id.internal", "smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
 		{"fail-sshCA-disabled", p3, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
+		{"fail-type-host", p4, args{"foo", SignSSHOptions{CertType: "host"}, pub}, nil, http.StatusUnauthorized, true, false},
+		{"fail-type-user", p4, args{"foo", SignSSHOptions{CertType: "host"}, pub}, nil, http.StatusUnauthorized, true, false},
 		{"fail-invalid-token", p1, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := tt.gcp.AuthorizeSSHSign(context.Background(), tt.args.token)
+			ctx := context.Background()
+			if tt.args.sshOpts.CertType == SSHUserCert {
+				ctx = NewContextWithCertType(ctx, SSHUserCert)
+			}
+
+			got, err := tt.gcp.AuthorizeSSHSign(ctx, tt.args.token)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GCP.AuthorizeSSHSign() error = %v, wantErr %v", err, tt.wantErr)
 				return

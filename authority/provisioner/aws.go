@@ -13,15 +13,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/smallstep/linkedca"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/sshutil"
 	"go.step.sm/crypto/x509util"
-	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/webhook"
@@ -169,7 +170,7 @@ type AWS struct {
 	DisableCustomSANs      bool     `json:"disableCustomSANs"`
 	DisableTrustOnFirstUse bool     `json:"disableTrustOnFirstUse"`
 	IMDSVersions           []string `json:"imdsVersions"`
-	InstanceAge            Duration `json:"instanceAge,omitempty"`
+	InstanceAge            Duration `json:"instanceAge"`
 	IIDRoots               string   `json:"iidRoots,omitempty"`
 	Claims                 *Claims  `json:"claims,omitempty"`
 	Options                *Options `json:"options,omitempty"`
@@ -358,7 +359,7 @@ func (p *AWS) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 	if p.DisableCustomSANs {
 		dnsName := fmt.Sprintf("ip-%s.%s.compute.internal", strings.ReplaceAll(doc.PrivateIP, ".", "-"), doc.Region)
 		so = append(so,
-			dnsNamesValidator([]string{dnsName}),
+			dnsNamesSubsetValidator([]string{dnsName}),
 			ipAddressesValidator([]net.IP{
 				net.ParseIP(doc.PrivateIP),
 			}),
@@ -590,11 +591,8 @@ func (p *AWS) authorizeToken(token string) (*awsPayload, error) {
 	// validate accounts
 	if len(p.Accounts) > 0 {
 		var found bool
-		for _, sa := range p.Accounts {
-			if sa == doc.AccountID {
-				found = true
-				break
-			}
+		if slices.Contains(p.Accounts, doc.AccountID) {
+			found = true
 		}
 		if !found {
 			return nil, errs.Unauthorized("aws.authorizeToken; invalid aws identity document - accountId is not valid")

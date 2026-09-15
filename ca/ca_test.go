@@ -41,7 +41,7 @@ func (cb *ClosingBuffer) Close() error {
 	return nil
 }
 
-func getCSR(priv interface{}) (*x509.CertificateRequest, error) {
+func getCSR(priv any) (*x509.CertificateRequest, error) {
 	_csr := &x509.CertificateRequest{
 		Subject:  pkix.Name{CommonName: "test.smallstep.com"},
 		DNSNames: []string{"test.smallstep.com"},
@@ -482,7 +482,7 @@ func TestCARoot(t *testing.T) {
 				ca:     ca,
 				sha:    "foo",
 				status: http.StatusNotFound,
-				errMsg: errs.NotFoundDefaultMsg,
+				errMsg: `root certificate with fingerprint "foo" was not found`,
 			}
 		},
 		"success": func(t *testing.T) *rootTest {
@@ -625,7 +625,7 @@ func TestCARenew(t *testing.T) {
 			cert, err := x509util.NewCertificate(cr)
 			assert.FatalError(t, err)
 			crt := cert.GetCertificate()
-			crt.NotBefore = time.Now()
+			crt.NotBefore = now
 			crt.NotAfter = leafExpiry
 			crt, err = x509util.CreateCertificate(crt, intermediateCert, pub, intermediateKey.(crypto.Signer))
 			assert.FatalError(t, err)

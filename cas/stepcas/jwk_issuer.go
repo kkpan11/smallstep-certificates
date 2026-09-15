@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/smallstep/cli-utils/ui"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/cas/apiv1"
-	"go.step.sm/cli-utils/ui"
-	"go.step.sm/crypto/jose"
-	"go.step.sm/crypto/randutil"
 )
 
 type jwkIssuer struct {
@@ -81,13 +83,13 @@ func (i *jwkIssuer) createToken(aud, sub string, sans []string, info *raInfo) (s
 	claims := defaultClaims(i.issuer, sub, aud, id)
 	builder := jose.Signed(i.signer).Claims(claims)
 	if len(sans) > 0 {
-		builder = builder.Claims(map[string]interface{}{
+		builder = builder.Claims(map[string]any{
 			"sans": sans,
 		})
 	}
 	if info != nil {
-		builder = builder.Claims(map[string]interface{}{
-			"step": map[string]interface{}{
+		builder = builder.Claims(map[string]any{
+			"step": map[string]any{
 				"ra": info,
 			},
 		})
